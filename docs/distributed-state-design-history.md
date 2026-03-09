@@ -1049,3 +1049,30 @@ abstraction (§6.0), multi-crate workspace (§6.0.3), and kameo adapter
 7. **Updated dependency graph** — PRs 8 and 9 can start after PR 1 merges
    (parallel with core crate work). PR 10 depends on PR 7 and PR 8.
 8. **Updated totals** — 10 PRs, ~14,200 lines, 230+ test cases.
+
+---
+
+## Iteration 33 — Public API Surface and Least Exposure
+
+**Trigger:** PR 1 implementation exposed all internal modules as `pub mod`,
+violating the least exposure design principle.
+
+**Changes:**
+
+1. **Added "Public API Surface — Least Exposure Principle" section** to the
+   design spec (§6.0.3), defining which modules and types are public vs
+   `pub(crate)` vs private.
+2. **Defined visibility rules:**
+   - `traits/` and `types/` are private modules; items are selectively
+     re-exported via `lib.rs` (e.g., `dstate::DistributedState` not
+     `dstate::traits::state::DistributedState`)
+   - `core/` is `pub(crate)` — pure logic only used by adapter crates
+     and internal modules
+   - `messages/` is `pub(crate)` — internal actor plumbing
+   - `test_support/` is `pub` — needed by adapter crates for conformance
+     tests and by downstream tests for `TestCluster`
+3. **Updated `lib.rs`** to use flat re-exports instead of `pub mod` for all
+   internal modules.
+4. **Updated all tests** to import from the public API surface
+   (`dstate::DistributedState`) instead of internal paths
+   (`dstate::traits::state::DistributedState`).

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dstate::test_support::test_runtime::*;
-use dstate::traits::runtime::*;
-use dstate::types::node::NodeId;
+use dstate::{
+    ActorRef, ActorRuntime, ClusterEvent, ClusterEvents, NodeId, ProcessingGroup, TimerHandle,
+};
 
 // ---------------------------------------------------------------------------
 // RT: ActorRuntime trait contract tests

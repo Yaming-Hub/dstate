@@ -1,7 +1,7 @@
 /// SM-01..SM-03: DistributedState trait tests
 /// DSM-01..DSM-10: DeltaDistributedState trait tests
 use dstate::test_support::test_state::*;
-use dstate::traits::state::*;
+use dstate::{DeserializeError, DistributedState, DeltaDistributedState, SyncUrgency};
 
 // ---------------------------------------------------------------------------
 // SM: DistributedState (simple) trait tests
@@ -28,7 +28,7 @@ fn sm_02_deserialize_rejects_unknown_wire_version() {
     let result = TestState::deserialize_state(&bytes, 999);
     assert!(result.is_err());
     match result.unwrap_err() {
-        dstate::types::errors::DeserializeError::UnknownVersion(v) => assert_eq!(v, 999),
+        DeserializeError::UnknownVersion(v) => assert_eq!(v, 999),
         other => panic!("expected UnknownVersion, got {other:?}"),
     }
 }

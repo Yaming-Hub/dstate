@@ -1,8 +1,7 @@
 /// ENV-01..ENV-07: Envelope type tests
 use std::time::Instant;
 
-use dstate::types::envelope::*;
-use dstate::types::node::NodeId;
+use dstate::{NodeId, StateObject, StateViewObject};
 
 #[test]
 fn env_01_state_object_age_starts_at_0() {

@@ -1226,6 +1226,73 @@ no dependency on any actor runtime. The adapter crate's job is to wire these
 pure structs into framework-specific actor shells. This keeps the core
 unit-testable without any framework overhead.
 
+#### Public API Surface — Least Exposure Principle
+
+The `dstate` core crate follows the **least exposure** principle: only types
+and traits that downstream consumers (application code or adapter crates)
+need are publicly exported. Internal implementation details are kept
+`pub(crate)` or private.
+
+**lib.rs re-exports — the only public surface:**
+
+```rust
+// ── Traits (what users implement) ───────────────────────────────
+pub use traits::state::{DistributedState, DeltaDistributedState, SyncUrgency};
+pub use traits::runtime::{
+    ActorRuntime, ActorRef, ProcessingGroup, ClusterEvents, TimerHandle, ClusterEvent,
+};
+pub use traits::persistence::{StatePersistence, PersistError};
+pub use traits::clock::{Clock, SystemClock};
+
+// ── Types (what users construct / receive) ──────────────────────
+pub use types::envelope::{StateObject, StateViewObject};
+pub use types::config::{StateConfig, SyncStrategy, PushMode, ChangeFeedConfig};
+pub use types::node::{NodeId, VersionMismatchPolicy};
+pub use types::errors::{
+    RegistryError, QueryError, MutationError, DeserializeError,
+};
+pub use traits::runtime::{
+    ActorSendError, ActorRequestError, GroupError, ClusterError,
+};
+pub use types::sync_message::{SyncMessage, ChangeNotification, BatchedChangeFeed};
+
+// ── Test support (feature-gated or cfg(test)) ───────────────────
+pub mod test_support;  // TestClock, InMemoryPersistence, FailingPersistence, TestRuntime
+```
+
+**Visibility rules by module:**
+
+| Module | Visibility | Rationale |
+|---|---|---|
+| `traits/` | Items re-exported via `lib.rs` | Traits are the contract — users implement or consume them |
+| `types/` | Items re-exported via `lib.rs` | Users construct configs, match on errors, send messages |
+| `core/` | `pub(crate)` | Pure logic — only adapter crates and `registry.rs` use it internally. Not exposed to application code. |
+| `messages/` | `pub(crate)` | Message enums are internal plumbing between actors. Adapter crates import them to wire actors but application code never touches them. |
+| `registry.rs` | `StateRegistry` re-exported via `lib.rs` | The registry is the user-facing entry point for registration |
+| `test_support/` | `pub` (entire module) | Must be accessible to adapter crates for conformance testing and to application tests for `TestCluster` |
+
+**What is NOT public:**
+
+- `core::shard_core::ShardCore` — internal state machine, only used by
+  adapter actor shells
+- `core::sync_logic`, `core::change_feed`, `core::versioning` — internal
+  decision logic
+- `messages::shard_msg`, `messages::sync_msg`, `messages::feed_msg` —
+  internal message envelopes between actors
+- Individual `traits/` and `types/` submodule paths (e.g.,
+  `dstate::traits::state::DistributedState` works but the preferred import
+  is `dstate::DistributedState`)
+
+**Adapter crates** (e.g., `dstate-ractor`) re-export the entire public API
+from `dstate` so that application code only needs a single dependency:
+
+```rust
+// In dstate-ractor/src/lib.rs:
+pub use dstate::*;
+pub use runtime::RactorRuntime;
+pub use actors::{StateShardActor, SyncEngineActor, ChangeFeedActor};
+```
+
 | Module | Contains | Depends on actor runtime? |
 |---|---|---|
 | `traits/` | All public trait definitions | ❌ (defines `ActorRuntime` but doesn't implement it) |

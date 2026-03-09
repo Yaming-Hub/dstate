@@ -1,6 +1,5 @@
 /// ERR-01, ERR-02: Error propagation tests
-use dstate::types::errors::*;
-use dstate::types::node::NodeId;
+use dstate::{MutationError, NodeId, QueryError, RegistryError};
 
 #[test]
 fn err_01_state_not_registered_propagates_through_query_error() {
