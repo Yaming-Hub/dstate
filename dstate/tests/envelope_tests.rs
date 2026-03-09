@@ -1,4 +1,4 @@
-/// ENV-01..ENV-07: Envelope type tests
+/// ENV-01..ENV-08: Envelope type tests
 use std::time::Instant;
 
 use dstate::{NodeId, StateObject, StateViewObject};
@@ -44,6 +44,7 @@ fn env_03_state_view_object_tracks_synced_at() {
         modified_time: 2000,
         synced_at: now,
         pending_remote_age: None,
+        pending_remote_incarnation: None,
         source_node: NodeId(1),
     };
     // synced_at should be close to now
@@ -74,6 +75,7 @@ fn env_05_wire_version_set() {
         modified_time: 1000,
         synced_at: Instant::now(),
         pending_remote_age: None,
+        pending_remote_incarnation: None,
         source_node: NodeId(1),
     };
     assert_eq!(view.wire_version, 3);
@@ -111,7 +113,32 @@ fn env_07_incarnation_propagated_to_view() {
         modified_time: obj.modified_time,
         synced_at: Instant::now(),
         pending_remote_age: None,
+        pending_remote_incarnation: None,
         source_node: NodeId(0),
     };
     assert_eq!(view.incarnation, obj.incarnation);
+}
+
+#[test]
+fn env_08_pending_remote_incarnation_tracks_restarts() {
+    let mut view = StateViewObject {
+        age: 100,
+        incarnation: 1,
+        wire_version: 1,
+        value: "stale",
+        created_time: 1000,
+        modified_time: 2000,
+        synced_at: Instant::now(),
+        pending_remote_age: None,
+        pending_remote_incarnation: None,
+        source_node: NodeId(1),
+    };
+
+    // Simulate receiving a change notification after owner restart
+    // incarnation=2, age=0 means the owner restarted
+    view.pending_remote_age = Some(0);
+    view.pending_remote_incarnation = Some(2);
+
+    // The view knows it is stale: newer incarnation exists
+    assert!(view.pending_remote_incarnation.unwrap() > view.incarnation);
 }

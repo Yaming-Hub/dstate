@@ -1,4 +1,4 @@
-/// RT-01..RT-14: ActorRuntime trait contract tests via TestRuntime
+/// RT-01..RT-13: ActorRuntime trait contract tests via TestRuntime
 /// MOCK-01..MOCK-05: TestRuntime self-tests
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use dstate::test_support::test_runtime::*;
 use dstate::{
-    ActorRef, ActorRuntime, ClusterEvent, ClusterEvents, NodeId, ProcessingGroup, TimerHandle,
+    ActorRef, ActorRuntime, ClusterEvent, ClusterEvents, NodeId, SubscriptionId, TimerHandle,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,48 +42,31 @@ async fn rt_02_send_delivers_message() {
 }
 
 #[tokio::test]
-async fn rt_03_request_returns_error_in_test_runtime() {
-    let rt = TestRuntime::new();
-    let actor: TestActorRef<u64> = rt.spawn("test", |_msg: u64| {});
-    let result: Result<u64, _> = actor.request(42u64, Duration::from_millis(100)).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn rt_04_request_times_out() {
-    // TestRuntime's request always returns error, which covers the timeout concept
-    let rt = TestRuntime::new();
-    let actor: TestActorRef<u64> = rt.spawn("test", |_: u64| {});
-    let result: Result<String, _> = actor.request(1u64, Duration::from_millis(10)).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn rt_05_processing_group_join_and_get_members() {
+async fn rt_05_group_join_and_get_members() {
     let rt = TestRuntime::new();
     let _a1: TestActorRef<u64> = rt.spawn("a1", |_: u64| {});
     let _a2: TestActorRef<u64> = rt.spawn("a2", |_: u64| {});
     let _a3: TestActorRef<u64> = rt.spawn("a3", |_: u64| {});
-    rt.groups().join("my_group", &_a1).unwrap();
-    rt.groups().join("my_group", &_a2).unwrap();
-    rt.groups().join("my_group", &_a3).unwrap();
-    let members: Vec<TestActorRef<u64>> = rt.groups().get_members("my_group").unwrap();
+    rt.join_group("my_group", &_a1).unwrap();
+    rt.join_group("my_group", &_a2).unwrap();
+    rt.join_group("my_group", &_a3).unwrap();
+    let members: Vec<TestActorRef<u64>> = rt.get_group_members("my_group").unwrap();
     assert_eq!(members.len(), 3);
 }
 
 #[tokio::test]
-async fn rt_06_processing_group_leave() {
+async fn rt_06_group_leave() {
     // Leave is simplified in TestRuntime (no-op), so just verify no panic
     let rt = TestRuntime::new();
     let a1: TestActorRef<u64> = rt.spawn("a1", |_: u64| {});
-    rt.groups().join("g", &a1).unwrap();
-    rt.groups().leave("g", &a1).unwrap();
+    rt.join_group("g", &a1).unwrap();
+    rt.leave_group("g", &a1).unwrap();
     // Members still shows 1 because TestRuntime leave is no-op
     // This is acceptable — conformance tests in adapter crates will validate real leave
 }
 
 #[tokio::test]
-async fn rt_07_processing_group_broadcast_reaches_all() {
+async fn rt_07_group_broadcast_reaches_all() {
     let rt = TestRuntime::new();
     let c1 = Arc::new(AtomicU64::new(0));
     let c2 = Arc::new(AtomicU64::new(0));
@@ -103,11 +86,11 @@ async fn rt_07_processing_group_broadcast_reaches_all() {
         r3.fetch_add(msg, Ordering::SeqCst);
     });
 
-    rt.groups().join("broadcast_group", &a1).unwrap();
-    rt.groups().join("broadcast_group", &a2).unwrap();
-    rt.groups().join("broadcast_group", &a3).unwrap();
+    rt.join_group("broadcast_group", &a1).unwrap();
+    rt.join_group("broadcast_group", &a2).unwrap();
+    rt.join_group("broadcast_group", &a3).unwrap();
 
-    rt.groups().broadcast("broadcast_group", 7u64).unwrap();
+    rt.broadcast_group("broadcast_group", 7u64).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(c1.load(Ordering::SeqCst), 7);
@@ -131,10 +114,10 @@ async fn rt_08_broadcast_skips_non_members() {
         nmc.fetch_add(msg, Ordering::SeqCst);
     });
 
-    rt.groups().join("exclusive", &member).unwrap();
+    rt.join_group("exclusive", &member).unwrap();
     // non_member is NOT joined
 
-    rt.groups().broadcast("exclusive", 10u64).unwrap();
+    rt.broadcast_group("exclusive", 10u64).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(member_count.load(Ordering::SeqCst), 10);
@@ -223,7 +206,7 @@ async fn rt_13_timer_cancel_stops_delivery() {
     timer.cancel();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let after_cancel = count.load(Ordering::SeqCst);
-    // After cancel, no more messages should arrive (allow ±1 for in-flight)
+    // After cancel, no more messages should arrive (allow +/-1 for in-flight)
     assert!(
         after_cancel <= before_cancel + 1,
         "expected no more than 1 extra after cancel, before={before_cancel} after={after_cancel}"
@@ -235,6 +218,38 @@ async fn rt_14_actor_ref_is_clone_send_sync() {
     fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
     assert_clone_send_sync::<TestActorRef<u64>>();
     assert_clone_send_sync::<TestActorRef<String>>();
+}
+
+#[tokio::test]
+async fn rt_15_subscribe_returns_subscription_id() {
+    let rt = TestRuntime::new();
+    let id: SubscriptionId = rt
+        .cluster_events()
+        .subscribe(Box::new(|_| {}))
+        .unwrap();
+    // Just verify we got a valid id (non-panicking)
+    let _ = format!("{id:?}");
+}
+
+#[tokio::test]
+async fn rt_16_unsubscribe_stops_notifications() {
+    let rt = TestRuntime::new();
+    let count = Arc::new(AtomicU64::new(0));
+    let c = count.clone();
+
+    let id = rt
+        .cluster_events()
+        .subscribe(Box::new(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        }))
+        .unwrap();
+
+    rt.test_cluster_events().emit(ClusterEvent::NodeJoined(NodeId(1)));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    rt.cluster_events().unsubscribe(id).unwrap();
+    rt.test_cluster_events().emit(ClusterEvent::NodeJoined(NodeId(2)));
+    assert_eq!(count.load(Ordering::SeqCst), 1); // no increment after unsubscribe
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +287,7 @@ async fn mock_01_test_runtime_spawns_independent_actors() {
 }
 
 #[tokio::test]
-async fn mock_02_processing_group_isolates_groups() {
+async fn mock_02_group_isolates_groups() {
     let rt = TestRuntime::new();
     let ga = Arc::new(AtomicU64::new(0));
     let gb = Arc::new(AtomicU64::new(0));
@@ -286,10 +301,10 @@ async fn mock_02_processing_group_isolates_groups() {
         rb.fetch_add(msg, Ordering::SeqCst);
     });
 
-    rt.groups().join("group_a", &a).unwrap();
-    rt.groups().join("group_b", &b).unwrap();
+    rt.join_group("group_a", &a).unwrap();
+    rt.join_group("group_b", &b).unwrap();
 
-    rt.groups().broadcast("group_a", 5u64).unwrap();
+    rt.broadcast_group("group_a", 5u64).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(ga.load(Ordering::SeqCst), 5);

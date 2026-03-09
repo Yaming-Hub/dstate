@@ -1,6 +1,4 @@
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use crate::types::node::NodeId;
@@ -21,30 +19,7 @@ impl fmt::Display for ActorSendError {
 
 impl std::error::Error for ActorSendError {}
 
-/// Error returned by `ActorRef::request()`.
-#[derive(Debug, Clone)]
-pub enum ActorRequestError {
-    /// The actor did not reply before the timeout expired.
-    Timeout,
-    /// The actor is no longer running.
-    ActorStopped,
-    /// Other send/receive failure.
-    Other(String),
-}
-
-impl fmt::Display for ActorRequestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Timeout => write!(f, "request timed out"),
-            Self::ActorStopped => write!(f, "actor stopped"),
-            Self::Other(msg) => write!(f, "request failed: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ActorRequestError {}
-
-/// Error returned by `ProcessingGroup` operations.
+/// Error returned by processing group operations.
 #[derive(Debug, Clone)]
 pub struct GroupError(pub String);
 
@@ -79,6 +54,11 @@ pub enum ClusterEvent {
     NodeLeft(NodeId),
 }
 
+/// Opaque handle returned by [`ClusterEvents::subscribe`], used to cancel
+/// a subscription via [`ClusterEvents::unsubscribe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriptionId(pub(crate) u64);
+
 // ---------------------------------------------------------------------------
 // Abstract traits
 // ---------------------------------------------------------------------------
@@ -88,59 +68,26 @@ pub enum ClusterEvent {
 /// `ActorRef` is the primary communication mechanism between actors and between
 /// external code and actors. Implementations must be cheaply cloneable and safe
 /// to share across threads.
+///
+/// Only fire-and-forget delivery is part of this trait. Request-reply patterns
+/// are framework-specific and should be handled at the adapter layer.
 pub trait ActorRef<M: Send + 'static>: Clone + Send + Sync + 'static {
     /// Fire-and-forget: deliver `msg` to the actor's mailbox.
     fn send(&self, msg: M) -> Result<(), ActorSendError>;
-
-    /// Request-reply: send `msg` and wait for a reply of type `R`.
-    fn request<R: Send + 'static>(
-        &self,
-        msg: M,
-        timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<R, ActorRequestError>> + Send + '_>>;
-}
-
-/// Named groups of actors for broadcasting.
-pub trait ProcessingGroup: Send + Sync + 'static {
-    /// The concrete `ActorRef` type used by this runtime.
-    type Ref<M: Send + 'static>: ActorRef<M>;
-
-    /// Add an actor to a named group.
-    fn join<M: Send + 'static>(
-        &self,
-        group_name: &str,
-        actor: &Self::Ref<M>,
-    ) -> Result<(), GroupError>;
-
-    /// Remove an actor from a named group.
-    fn leave<M: Send + 'static>(
-        &self,
-        group_name: &str,
-        actor: &Self::Ref<M>,
-    ) -> Result<(), GroupError>;
-
-    /// Broadcast a message to all members of a named group.
-    fn broadcast<M: Clone + Send + 'static>(
-        &self,
-        group_name: &str,
-        msg: M,
-    ) -> Result<(), GroupError>;
-
-    /// Get all members of a named group.
-    fn get_members<M: Send + 'static>(
-        &self,
-        group_name: &str,
-    ) -> Result<Vec<Self::Ref<M>>, GroupError>;
 }
 
 /// Subscription to cluster membership events.
 pub trait ClusterEvents: Send + Sync + 'static {
     /// Subscribe to cluster membership changes. The callback is invoked for
-    /// each `NodeJoined` / `NodeLeft` event.
+    /// each `NodeJoined` / `NodeLeft` event. Returns a [`SubscriptionId`]
+    /// that can be used to cancel the subscription.
     fn subscribe(
         &self,
         on_event: Box<dyn Fn(ClusterEvent) + Send + Sync>,
-    ) -> Result<(), ClusterError>;
+    ) -> Result<SubscriptionId, ClusterError>;
+
+    /// Remove a previously registered subscription. Idempotent.
+    fn unsubscribe(&self, id: SubscriptionId) -> Result<(), ClusterError>;
 }
 
 /// A handle to a scheduled timer that can be cancelled.
@@ -152,14 +99,14 @@ pub trait TimerHandle: Send + 'static {
 
 /// The top-level actor runtime abstraction. One instance per node.
 ///
-/// Provides actor spawning, timer scheduling, and access to the processing
-/// group and cluster event subsystems.
+/// Provides actor spawning, timer scheduling, processing group management,
+/// and access to the cluster event subsystem. Processing group methods are
+/// part of this trait (rather than a separate trait) so that all group
+/// operations use the same `Self::Ref<M>` type family without requiring
+/// cross-trait GAT equality constraints.
 pub trait ActorRuntime: Send + Sync + 'static {
     /// The concrete actor reference type.
     type Ref<M: Send + 'static>: ActorRef<M>;
-
-    /// The processing group implementation.
-    type Group: ProcessingGroup<Ref<u8> = Self::Ref<u8>>;
 
     /// The cluster events implementation.
     type Events: ClusterEvents;
@@ -170,8 +117,6 @@ pub trait ActorRuntime: Send + Sync + 'static {
     /// Spawn a new actor with the given name and message handler.
     ///
     /// The handler receives messages one at a time (mailbox serialization).
-    /// `state` is the actor's initial mutable state, accessible inside the
-    /// handler via the closure capture.
     fn spawn<M, H>(
         &self,
         name: &str,
@@ -197,8 +142,32 @@ pub trait ActorRuntime: Send + Sync + 'static {
         msg: M,
     ) -> Self::Timer;
 
-    /// Access the processing group subsystem.
-    fn groups(&self) -> &Self::Group;
+    /// Add an actor to a named processing group.
+    fn join_group<M: Send + 'static>(
+        &self,
+        group_name: &str,
+        actor: &Self::Ref<M>,
+    ) -> Result<(), GroupError>;
+
+    /// Remove an actor from a named processing group.
+    fn leave_group<M: Send + 'static>(
+        &self,
+        group_name: &str,
+        actor: &Self::Ref<M>,
+    ) -> Result<(), GroupError>;
+
+    /// Broadcast a message to all members of a named processing group.
+    fn broadcast_group<M: Clone + Send + 'static>(
+        &self,
+        group_name: &str,
+        msg: M,
+    ) -> Result<(), GroupError>;
+
+    /// Get all members of a named processing group.
+    fn get_group_members<M: Send + 'static>(
+        &self,
+        group_name: &str,
+    ) -> Result<Vec<Self::Ref<M>>, GroupError>;
 
     /// Access the cluster event subsystem.
     fn cluster_events(&self) -> &Self::Events;

@@ -2,7 +2,7 @@
 /// TEST-08..TEST-10: Test doubles tests
 use std::time::Duration;
 
-use dstate::{Clock, StatePersistence};
+use dstate::{Clock, StateObject, StatePersistence};
 use dstate::test_support::test_clock::TestClock;
 use dstate::test_support::test_persist::{FailingPersistence, InMemoryPersistence};
 
@@ -57,16 +57,36 @@ fn test_04_freshness_check_uses_clock() {
 #[tokio::test]
 async fn test_08_in_memory_persistence_round_trip() {
     let persist = InMemoryPersistence::<String>::new();
-    let state = "hello world".to_string();
+    let state = StateObject {
+        age: 5,
+        incarnation: 1,
+        storage_version: 1,
+        value: "hello world".to_string(),
+        created_time: 1000,
+        modified_time: 2000,
+    };
     persist.save(&state, None).await.unwrap();
-    let loaded = persist.load().await.unwrap();
-    assert_eq!(loaded, Some("hello world".to_string()));
+    let loaded = persist.load().await.unwrap().unwrap();
+    assert_eq!(loaded.value, "hello world");
+    assert_eq!(loaded.age, 5);
+    assert_eq!(loaded.incarnation, 1);
+    assert_eq!(loaded.storage_version, 1);
+    assert_eq!(loaded.created_time, 1000);
+    assert_eq!(loaded.modified_time, 2000);
 }
 
 #[tokio::test]
 async fn test_09_failing_persistence_always_returns_error() {
     let persist = FailingPersistence;
-    let save_result = StatePersistence::<String>::save(&persist, &"test".to_string(), None).await;
+    let state = StateObject {
+        age: 0,
+        incarnation: 1,
+        storage_version: 1,
+        value: "test".to_string(),
+        created_time: 0,
+        modified_time: 0,
+    };
+    let save_result = StatePersistence::<String>::save(&persist, &state, None).await;
     assert!(save_result.is_err());
     let load_result = StatePersistence::<String>::load(&persist).await;
     assert!(load_result.is_err());
@@ -76,5 +96,5 @@ async fn test_09_failing_persistence_always_returns_error() {
 async fn test_10_in_memory_persistence_load_returns_none_initially() {
     let persist = InMemoryPersistence::<String>::new();
     let loaded = persist.load().await.unwrap();
-    assert_eq!(loaded, None);
+    assert!(loaded.is_none());
 }

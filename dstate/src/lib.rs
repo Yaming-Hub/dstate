@@ -1,7 +1,7 @@
 // ── Traits (what users implement) ────────────────────────────────
 pub use traits::state::{DeltaDistributedState, DistributedState, SyncUrgency};
 pub use traits::runtime::{
-    ActorRef, ActorRuntime, ClusterEvent, ClusterEvents, ProcessingGroup, TimerHandle,
+    ActorRef, ActorRuntime, ClusterEvent, ClusterEvents, TimerHandle,
 };
 pub use traits::persistence::{PersistError, StatePersistence};
 pub use traits::clock::{Clock, SystemClock};
@@ -14,7 +14,7 @@ pub use types::errors::{
     DeserializeError, MutationError, QueryError, RegistryError,
 };
 pub use traits::runtime::{
-    ActorRequestError, ActorSendError, ClusterError, GroupError,
+    ActorSendError, ClusterError, GroupError, SubscriptionId,
 };
 pub use types::sync_message::{BatchedChangeFeed, ChangeNotification, SyncMessage};
 

@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use std::fmt;
 
+use crate::types::envelope::StateObject;
+
 /// Errors from persistence operations.
 #[derive(Debug, Clone)]
 pub enum PersistError {
@@ -26,20 +28,23 @@ impl std::error::Error for PersistError {}
 
 /// Async trait for persisting state to durable storage.
 ///
-/// Implementations must be `Send + Sync` so they can be shared across
-/// async tasks.
+/// Operates on [`StateObject<S>`] to preserve metadata (age, incarnation,
+/// storage version, timestamps) alongside the state value. This ensures
+/// the full envelope round-trips through persistence, enabling correct
+/// restart ordering and migration.
 #[async_trait]
 pub trait StatePersistence<S: Send + Sync + 'static>: Send + Sync {
     /// The delta type passed alongside saves when delta information is available.
     type StateDeltaChange: Send + Sync + 'static;
 
-    /// Persist the current state, optionally with a delta describing what changed.
+    /// Persist the current state envelope, optionally with a delta describing
+    /// what changed.
     async fn save(
         &self,
-        state: &S,
+        state: &StateObject<S>,
         state_delta: Option<&Self::StateDeltaChange>,
     ) -> Result<(), PersistError>;
 
-    /// Load the most recently persisted state, if any.
-    async fn load(&self) -> Result<Option<S>, PersistError>;
+    /// Load the most recently persisted state envelope, if any.
+    async fn load(&self) -> Result<Option<StateObject<S>>, PersistError>;
 }

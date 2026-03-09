@@ -19,7 +19,4 @@ pub enum VersionMismatchPolicy {
     /// Remove the peer's view from the PublicViewMap until a compatible
     /// version arrives.
     DropAndWait,
-    /// Send a re-serialization request to the peer asking it to resend at
-    /// a version we support.
-    RequestReserialization,
 }

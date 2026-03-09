@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use std::sync::Mutex;
 
 use crate::traits::persistence::{PersistError, StatePersistence};
+use crate::types::envelope::StateObject;
 
-/// In-memory persistence for testing. Stores a single serialized state.
+/// In-memory persistence for testing. Stores a single state envelope.
 pub struct InMemoryPersistence<S: Clone + Send + Sync + 'static> {
-    stored: Mutex<Option<S>>,
+    stored: Mutex<Option<StateObject<S>>>,
 }
 
 impl<S: Clone + Send + Sync + 'static> InMemoryPersistence<S> {
@@ -28,7 +29,7 @@ impl<S: Clone + Send + Sync + 'static> StatePersistence<S> for InMemoryPersisten
 
     async fn save(
         &self,
-        state: &S,
+        state: &StateObject<S>,
         _state_delta: Option<&Self::StateDeltaChange>,
     ) -> Result<(), PersistError> {
         let mut stored = self.stored.lock().unwrap();
@@ -36,7 +37,7 @@ impl<S: Clone + Send + Sync + 'static> StatePersistence<S> for InMemoryPersisten
         Ok(())
     }
 
-    async fn load(&self) -> Result<Option<S>, PersistError> {
+    async fn load(&self) -> Result<Option<StateObject<S>>, PersistError> {
         let stored = self.stored.lock().unwrap();
         Ok(stored.clone())
     }
@@ -51,7 +52,7 @@ impl<S: Send + Sync + 'static> StatePersistence<S> for FailingPersistence {
 
     async fn save(
         &self,
-        _state: &S,
+        _state: &StateObject<S>,
         _state_delta: Option<&Self::StateDeltaChange>,
     ) -> Result<(), PersistError> {
         Err(PersistError::StorageUnavailable(
@@ -59,7 +60,7 @@ impl<S: Send + Sync + 'static> StatePersistence<S> for FailingPersistence {
         ))
     }
 
-    async fn load(&self) -> Result<Option<S>, PersistError> {
+    async fn load(&self) -> Result<Option<StateObject<S>>, PersistError> {
         Err(PersistError::StorageUnavailable(
             "FailingPersistence always fails".into(),
         ))

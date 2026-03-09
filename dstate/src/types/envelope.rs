@@ -39,6 +39,9 @@ pub struct StateViewObject<V> {
     /// If set, the peer has announced a higher age via a change feed
     /// notification, meaning this view is known to be stale.
     pub pending_remote_age: Option<u64>,
+    /// If set, the peer has announced a higher incarnation via a change feed
+    /// notification (e.g., after an owner restart).
+    pub pending_remote_incarnation: Option<u64>,
     /// The node that owns this view.
     pub source_node: NodeId,
 }

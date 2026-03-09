@@ -1076,3 +1076,59 @@ violating the least exposure design principle.
 4. **Updated all tests** to import from the public API surface
    (`dstate::DistributedState`) instead of internal paths
    (`dstate::traits::state::DistributedState`).
+
+## Iteration 34 — Multi-Model Code Review Fixes
+
+**Trigger:** GPT-5.4 and Gemini 3 Pro independently reviewed PR #2 and
+identified 7 issues (5 design, 2 bugs). Two issues were flagged by both models.
+
+**Changes:**
+
+1. **Merged `ProcessingGroup` into `ActorRuntime`** (flagged by both models).
+   The separate `ProcessingGroup` trait used a GAT `Ref<M>` that could not be
+   proven equal to `ActorRuntime::Ref<M>` for all `M` due to Rust's current
+   GAT limitations. The `u8` witness hack (`Ref<u8> = Self::Ref<u8>`) only
+   proved equality for `u8`. Processing group methods (`join_group`,
+   `leave_group`, `broadcast_group`, `get_group_members`) are now directly
+   on `ActorRuntime`, using `Self::Ref<M>` consistently.
+
+2. **Removed `RequestReserialization`** from `VersionMismatchPolicy` (flagged
+   by both models). The wire protocol has no version negotiation mechanism —
+   `serialize_view`/`serialize_delta` take no target version argument, and
+   `WIRE_VERSION` is a compile-time constant. The variant was unimplementable.
+   Only `KeepStale` and `DropAndWait` remain.
+
+3. **Removed `request<R>` from `ActorRef`** (GPT-5.4). The method allowed
+   callers to specify an arbitrary reply type `R` unrelated to the message
+   type `M`, making it unsound. dstate's internal protocol uses fire-and-forget
+   messages (e.g., `RequestSnapshot` → `FullSnapshot`) rather than RPC-style
+   request-reply. `ActorRef` now has only `send()`. Request-reply patterns
+   are framework-specific and handled at the adapter layer. Removed
+   `ActorRequestError` type.
+
+4. **Persistence now operates on `StateObject<S>`** (GPT-5.4). Previously,
+   `StatePersistence::save/load` operated on bare `S`, losing all envelope
+   metadata (age, incarnation, storage_version, timestamps). After a restart,
+   the core layer could not determine if migration was needed or restore
+   ordering info. Now `save(&StateObject<S>, ...)` and
+   `load() -> Option<StateObject<S>>` preserve the full envelope.
+
+5. **Added `pending_remote_incarnation` to `StateViewObject`** (GPT-5.4).
+   Previously only `pending_remote_age: Option<u64>` was tracked. After an
+   owner restart, `(incarnation=2, age=0)` is newer than cached
+   `(incarnation=1, age=100)`, but age-only comparison missed this. Both
+   incarnation and age are now tracked for correct staleness detection.
+
+6. **Added `SubscriptionId` and `unsubscribe()` to `ClusterEvents`** (Gemini).
+   Previously `subscribe()` returned `Result<(), ClusterError>` with no way
+   to remove callbacks. Now it returns `Result<SubscriptionId, ClusterError>`,
+   and `unsubscribe(id)` removes the callback. Prevents memory leaks in
+   long-running applications.
+
+7. **`TestActorRef::request` removal** (Gemini). Automatically resolved by
+   change #3 — removing `request` from `ActorRef` eliminated the test
+   implementation that always returned an error.
+
+**Test impact:** Removed 2 tests (RT-03, RT-04 for request-reply). Added
+2 new tests (RT-15, RT-16 for subscribe/unsubscribe; ENV-08 for incarnation
+tracking). Net: 50 → 51 tests, all passing.
