@@ -1,1 +1,1 @@
-// Core pure logic — populated in PR 2+
+pub(crate) mod shard_core;
