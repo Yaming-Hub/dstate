@@ -988,3 +988,64 @@ Address valid comments, resolve others with rationale.
 | 1 | GPT-5.2 + Gemini | O(N) ArcSwap clone scalability | Acknowledged; acceptable for v1 cluster sizes. `Arc<V>` optimization documented. |
 | 2 | GPT-5.2 | Error handling has `todo!()` | Intentional per iteration 17 — user deferred error handling |
 | 3 | Gemini 3 Pro | `String` state_name on wire | Debuggability trade-off; batching amortizes overhead |
+
+---
+
+## Iteration 32 — Test Plan and Dev Plan for Multi-Crate Architecture
+
+**Trigger:** Test plan and dev plan were written for a single-crate
+ractor-based architecture. They need updating to reflect the actor runtime
+abstraction (§6.0), multi-crate workspace (§6.0.3), and kameo adapter
+(§6.0.5).
+
+**Changes to test plan:**
+
+1. **Updated intro** — added multi-crate testing strategy table showing which
+   crate tests what and which runtime is used (`TestRuntime` for core,
+   `RactorRuntime` / `KameoRuntime` for adapters).
+2. **Added §5.0 Actor Runtime Abstraction tests** — 14 new tests (RT-01
+   through RT-14) verifying the abstract `ActorRuntime` trait contracts via
+   `TestRuntime`: send, request, timeout, processing groups, cluster events,
+   timers, cancellation.
+3. **Updated §5.1 StateRegistry** — REG-01 now uses
+   `StateRegistry<TestRuntime>`. Added REG-07 for runtime-generic test.
+4. **Updated §5.2** — renamed to "StateShard / ShardCore" with note about
+   `ShardCore` being pure state machine tested without framework.
+5. **Updated ERR-04** — changed `ActorError` to `ActorSendError` /
+   `ActorRequestError`.
+6. **Updated FLOW-01** — made framework-agnostic (uses `ActorRef::request()`).
+7. **Updated §15.4 TestCluster** — added note about using `TestRuntime`.
+8. **Added §16 Multi-Crate Architecture Tests** with 3 subsections:
+   - §16.0 TestRuntime self-tests (MOCK-01 through MOCK-05)
+   - §16.1 Adapter Conformance Tests (ADAPT-01 through ADAPT-08) — same
+     test bodies run against each adapter
+   - §16.2 Ractor Adapter tests (RACTOR-01 through RACTOR-07)
+   - §16.3 Kameo Adapter tests (KAMEO-01 through KAMEO-11)
+
+**Total new tests:** 45 (RT-14 + MOCK-5 + ADAPT-8 + RACTOR-7 + KAMEO-11)
+
+**Changes to dev plan:**
+
+1. **Updated guiding principles** — added principle 6 "Core before adapters"
+   and mention of multi-crate workspace.
+2. **Restructured from 8 PRs to 10 PRs:**
+   - PRs 1–7: `dstate` core crate (runtime-agnostic, tested with
+     `TestRuntime`)
+   - PR 8: `dstate-ractor` adapter crate (new)
+   - PR 9: `dstate-kameo` adapter crate (new)
+   - PR 10: Example, stress tests, docs (replaces old PR 8)
+3. **PR 1 expanded** — now includes workspace scaffold, all abstract trait
+   definitions (`ActorRuntime`, `ActorRef`, `ProcessingGroup`,
+   `ClusterEvents`, `TimerHandle`), `TestRuntime` mock, and runtime trait
+   contract tests (RT-\*, MOCK-\*). Estimated 1200 lines (was 900).
+4. **PRs 2–7** — updated to remove ractor-specific references. All use
+   framework-agnostic types and `TestRuntime` for tests.
+5. **PR 8 (new)** — `dstate-ractor` adapter: `RactorRuntime`,
+   `RactorActorRef`, `RactorProcessingGroup`, `RactorClusterEvents`,
+   `RactorTimerHandle`, actor wrappers, re-exports. ~1200 lines.
+6. **PR 9 (new)** — `dstate-kameo` adapter: `KameoRuntime`, PubSub-based
+   groups, ActorSwarm cluster events, tokio task timers, actor wrappers.
+   ~1200 lines.
+7. **Updated dependency graph** — PRs 8 and 9 can start after PR 1 merges
+   (parallel with core crate work). PR 10 depends on PR 7 and PR 8.
+8. **Updated totals** — 10 PRs, ~14,200 lines, 230+ test cases.
