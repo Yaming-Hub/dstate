@@ -1,0 +1,18 @@
+[package]
+name = "dstate"
+version = "0.1.0"
+edition = "2021"
+description = "Distributed state replication across actor-based clusters"
+license = "MIT"
+
+[dependencies]
+arc-swap = "1"
+async-trait = "0.1"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
