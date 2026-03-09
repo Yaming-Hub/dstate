@@ -160,10 +160,12 @@ impl ProcessingGroup for TestProcessingGroup {
 // TestClusterEvents
 // ---------------------------------------------------------------------------
 
+type ClusterSubscribers = Vec<Box<dyn Fn(ClusterEvent) + Send + Sync>>;
+
 /// Test cluster events that can be triggered manually.
 #[derive(Clone)]
 pub struct TestClusterEvents {
-    subscribers: Arc<Mutex<Vec<Box<dyn Fn(ClusterEvent) + Send + Sync>>>>,
+    subscribers: Arc<Mutex<ClusterSubscribers>>,
 }
 
 impl TestClusterEvents {

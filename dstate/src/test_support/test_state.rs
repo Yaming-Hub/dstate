@@ -8,19 +8,10 @@ use crate::types::errors::DeserializeError;
 // ---------------------------------------------------------------------------
 
 /// A simple test state where State == View (no projection).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestState {
     pub counter: u64,
     pub label: String,
-}
-
-impl Default for TestState {
-    fn default() -> Self {
-        Self {
-            counter: 0,
-            label: String::new(),
-        }
-    }
 }
 
 impl DistributedState for TestState {
