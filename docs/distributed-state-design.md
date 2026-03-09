@@ -150,13 +150,10 @@ pub trait DeltaDistributedState: Send + Sync + 'static {
     fn apply_delta(view: &mut Self::View, delta: &Self::Delta);
 
     /// Serialize a view to bytes for the wire.
-    /// The `target_version` parameter allows serializing at an older format
-    /// for backward compatibility (used by `VersionMismatchPolicy::RequestReserialization`).
-    /// Implementations must support at least `[WIRE_VERSION - 1, WIRE_VERSION]`.
-    fn serialize_view(view: &Self::View, target_version: u32) -> Vec<u8>;
+    fn serialize_view(view: &Self::View) -> Vec<u8>;
     fn deserialize_view(bytes: &[u8], wire_version: u32) -> Result<Self::View, DeserializeError>;
-    /// Serialize a delta. Same version parameter semantics as `serialize_view`.
-    fn serialize_delta(delta: &Self::Delta, target_version: u32) -> Vec<u8>;
+    /// Serialize a delta.
+    fn serialize_delta(delta: &Self::Delta) -> Vec<u8>;
     fn deserialize_delta(bytes: &[u8], wire_version: u32) -> Result<Self::Delta, DeserializeError>;
 
     /// Evaluate a delta and return the desired sync urgency.
@@ -729,13 +726,7 @@ flowchart TD
     Try -->|Ok| Apply["Apply to local view"]
     Try -->|Err: version unknown| Decision{"VersionMismatchPolicy"}
 
-    Decision -->|RequestReserialization| Req["Ask owner to re-send<br/>at our max supported version"]
-    Req --> Retry["Owner re-serializes<br/>at requested version"]
-    Retry --> Try2["deserialize(bytes, V')"]
-    Try2 -->|Ok| Apply
-    Try2 -->|Err| StaleKeep["Keep stale view + log warning"]
-
-    Decision -->|KeepStale| StaleKeep
+    Decision -->|KeepStale| StaleKeep["Keep stale view + log warning"]
     Decision -->|DropAndWait| Drop["Drop view for this peer<br/>until versions converge"]
 ```
 
@@ -744,12 +735,6 @@ The state author configures the policy during registration:
 ```rust
 /// How to handle incoming sync messages with an unrecognized wire_version.
 pub enum VersionMismatchPolicy {
-    /// Ask the owner to re-serialize the view/delta at a version we support.
-    /// This adds one extra round-trip but keeps the view fresh.
-    /// The request includes `max_supported_version` so the owner can pick
-    /// the highest mutually compatible format.
-    RequestReserialization,
-
     /// Keep the last successfully deserialized view and log a warning.
     /// The view becomes increasingly stale until the local node is upgraded.
     /// Best when staleness is tolerable and you want zero extra network traffic.
@@ -882,13 +867,6 @@ When evolving a state's serialization format across versions:
    `S::WIRE_VERSION` → stamped on `SyncMessage` by sender → read by receiver →
    passed to `deserialize_view(bytes, wire_version)`.
 
-   > **Note on `RequestReserialization`:** With the two-phase pattern, the
-   > `VersionMismatchPolicy::RequestReserialization` option is largely
-   > unnecessary — there should never be a window where the receiver encounters
-   > a version it cannot understand. The `KeepStale` or `DropAndWait` policies
-   > serve as safety nets for unexpected version skew (e.g., a botched partial
-   > rollout).
-
 3. **Multiple versions in flight** — The `wire_version` in `SyncMessage` tells
    the receiver exactly which format was used. The receiver should support
    deserializing at least versions `[current - 1, current]` so that the upgrade
@@ -919,9 +897,8 @@ providers can be swapped without changing any business logic.
 ```mermaid
 graph TD
     DS["distributed-state crate"]
-    DS -->|"programs against"| RT["trait ActorRuntime"]
+    DS -->|"programs against"| RT["trait ActorRuntime<br/>(includes group ops)"]
     DS -->|"programs against"| AR["trait ActorRef"]
-    DS -->|"programs against"| PG["trait ProcessingGroup"]
     DS -->|"programs against"| CE["trait ClusterEvents"]
     DS -->|"programs against"| TH["trait TimerHandle"]
 
@@ -943,10 +920,10 @@ graph TD
 | # | Capability | Why the crate needs it | Trait |
 |---|---|---|---|
 | 1 | **Single-threaded actor execution** | StateShard and SyncEngine process messages one at a time — no locks needed for state mutation or view-map swaps. | `ActorRuntime` |
-| 2 | **Remote actor messaging** | SyncEngine sends snapshots/deltas to peer SyncEngines on other nodes. Both fire-and-forget (`send`) and request-reply (`request`) patterns are used. | `ActorRef<M>` |
-| 3 | **Actor registration / discovery** | The StateRegistry must look up StateShard actors by name. Peer SyncEngines must discover each other across nodes. | `ActorRuntime::register` / `ProcessingGroup::get_members` |
+| 2 | **Remote actor messaging** | SyncEngine sends snapshots/deltas to peer SyncEngines on other nodes. Fire-and-forget (`send`) is the primary pattern; request-reply is framework-specific and handled at the adapter layer. | `ActorRef<M>` |
+| 3 | **Actor registration / discovery** | The StateRegistry must look up StateShard actors by name. Peer SyncEngines must discover each other across nodes. | `ActorRuntime::get_group_members` |
 | 4 | **Cluster node join/leave events** | ClusterMembership listener must be notified when nodes join or leave so it can propagate events to all StateShards. | `ClusterEvents` |
-| 5 | **Message broadcasting** | SyncEngine broadcasts snapshots/deltas to all peers of the same state type. ChangeFeedAggregator broadcasts batched notifications to all peer aggregators. | `ProcessingGroup` |
+| 5 | **Message broadcasting** | SyncEngine broadcasts snapshots/deltas to all peers of the same state type. ChangeFeedAggregator broadcasts batched notifications to all peer aggregators. | `ActorRuntime::broadcast_group` |
 
 #### 6.0.2 Abstract Trait Definitions
 
@@ -967,13 +944,10 @@ pub trait ActorRef<M: Send + 'static>: Clone + Send + Sync + 'static {
     fn send(&self, msg: M) -> Result<(), ActorSendError>;
 
     /// Request-reply: send a message and wait for a response.
-    /// The message type must carry a reply channel (framework-specific).
-    /// Times out if no response is received within `timeout`.
-    fn request<R: Send + 'static>(
-        &self,
-        msg: M,
-        timeout: Duration,
-    ) -> impl Future<Output = Result<R, ActorRequestError>> + Send;
+    /// Only fire-and-forget delivery is part of this trait.
+    /// Request-reply patterns are framework-specific and should be
+    /// handled at the adapter layer.
+    fn send(&self, msg: M) -> Result<(), ActorSendError>;
 }
 
 /// Errors from fire-and-forget sends.
@@ -983,44 +957,10 @@ pub enum ActorSendError {
     ActorUnavailable,
 }
 
-/// Errors from request-reply calls.
-#[derive(Debug)]
-pub enum ActorRequestError {
-    /// The actor did not respond within the timeout.
-    Timeout,
-    /// The actor has stopped.
-    ActorUnavailable,
-    /// The reply channel was dropped without sending a response.
-    ReplyDropped,
-}
-
-/// A named group of actors (potentially across nodes) that can be
-/// broadcast to as a unit. Processing groups decouple senders from
-/// receivers — a sender broadcasts to the group name, and the
-/// framework delivers the message to all current members.
-pub trait ProcessingGroup: Send + Sync + 'static {
-    type MemberRef;
-
-    /// Join this actor to the named group.
-    fn join(&self, group_name: &str) -> Result<(), GroupError>;
-
-    /// Leave the named group. Called on actor shutdown.
-    fn leave(&self, group_name: &str) -> Result<(), GroupError>;
-
-    /// Broadcast a serialized message to all members of the group.
-    /// The framework handles cross-node delivery.
-    fn broadcast<M: Send + Clone + 'static>(
-        &self,
-        group_name: &str,
-        msg: M,
-    ) -> Result<(), GroupError>;
-
-    /// Get current members of the group (for point-to-point sends).
-    fn get_members(
-        &self,
-        group_name: &str,
-    ) -> Result<Vec<Self::MemberRef>, GroupError>;
-}
+/// Opaque handle returned by `ClusterEvents::subscribe`, used to
+/// cancel a subscription via `ClusterEvents::unsubscribe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriptionId(pub(crate) u64);
 
 #[derive(Debug)]
 pub enum GroupError {
@@ -1032,12 +972,15 @@ pub enum GroupError {
 /// The distributed state crate subscribes once at startup and
 /// routes events to all registered StateShards via the StateRegistry.
 pub trait ClusterEvents: Send + Sync + 'static {
-    /// Subscribe to cluster membership changes. The callback is
-    /// invoked on each join/leave event.
+    /// Subscribe to cluster membership changes. Returns a handle
+    /// for later unsubscription.
     fn subscribe(
         &self,
         on_event: Box<dyn Fn(ClusterEvent) + Send + Sync>,
-    ) -> Result<(), ClusterError>;
+    ) -> Result<SubscriptionId, ClusterError>;
+
+    /// Remove a previously registered subscription. Idempotent.
+    fn unsubscribe(&self, id: SubscriptionId) -> Result<(), ClusterError>;
 }
 
 pub enum ClusterEvent {
@@ -1060,14 +1003,16 @@ pub trait TimerHandle: Send + 'static {
     fn cancel(self);
 }
 
-/// The top-level runtime abstraction. Provides actor lifecycle and
-/// timer scheduling. One instance per node.
+/// The top-level runtime abstraction. Provides actor lifecycle,
+/// timer scheduling, and processing group management. One instance
+/// per node.
 ///
-/// All `StateShard`, `SyncEngine`, and `ChangeFeedAggregator` actors
-/// are spawned through this trait.
+/// Processing group methods are part of this trait (rather than a
+/// separate trait) so that all group operations use the same
+/// `Self::Ref<M>` type family without requiring cross-trait GAT
+/// equality constraints.
 pub trait ActorRuntime: Send + Sync + 'static {
     type Ref<M: Send + 'static>: ActorRef<M>;
-    type Group: ProcessingGroup;
     type Events: ClusterEvents;
     type Timer: TimerHandle;
 
@@ -1105,8 +1050,32 @@ pub trait ActorRuntime: Send + Sync + 'static {
         msg: M,
     ) -> Self::Timer;
 
-    /// Access the processing group facility.
-    fn groups(&self) -> &Self::Group;
+    /// Add an actor to a named processing group.
+    fn join_group<M: Send + 'static>(
+        &self,
+        group_name: &str,
+        actor: &Self::Ref<M>,
+    ) -> Result<(), GroupError>;
+
+    /// Remove an actor from a named processing group.
+    fn leave_group<M: Send + 'static>(
+        &self,
+        group_name: &str,
+        actor: &Self::Ref<M>,
+    ) -> Result<(), GroupError>;
+
+    /// Broadcast a message to all members of a named group.
+    fn broadcast_group<M: Clone + Send + 'static>(
+        &self,
+        group_name: &str,
+        msg: M,
+    ) -> Result<(), GroupError>;
+
+    /// Get current members of the group (for point-to-point sends).
+    fn get_group_members<M: Send + 'static>(
+        &self,
+        group_name: &str,
+    ) -> Result<Vec<Self::Ref<M>>, GroupError>;
 
     /// Access the cluster events facility.
     fn cluster_events(&self) -> &Self::Events;
@@ -1146,7 +1115,7 @@ graph TD
 
 | Crate | Role | Dependencies |
 |---|---|---|
-| `dstate` | Core library. Defines all public traits (`DistributedState`, `DeltaDistributedState`, `ActorRuntime`, `ActorRef`, `ProcessingGroup`, `ClusterEvents`, `TimerHandle`, `StatePersistence`, `Clock`), data types (`StateObject`, `StateViewObject`, `SyncMessage`, `ChangeNotification`, etc.), pure logic (`ShardCore`), error types, and configuration structs. **No actor framework dependency.** | `arc-swap`, `tokio` (time only) |
+| `dstate` | Core library. Defines all public traits (`DistributedState`, `DeltaDistributedState`, `ActorRuntime`, `ActorRef`, `ClusterEvents`, `TimerHandle`, `StatePersistence`, `Clock`), data types (`StateObject`, `StateViewObject`, `SyncMessage`, `ChangeNotification`, etc.), pure logic (`ShardCore`), error types, and configuration structs. **No actor framework dependency.** Processing group operations are part of `ActorRuntime`. | `arc-swap`, `tokio` (time only) |
 | `dstate-ractor` | Ractor adapter. Implements `ActorRuntime` for ractor, wires `StateShard`/`SyncEngine`/`ChangeFeedAggregator` as ractor actors, and provides a ready-to-use `StateRegistry<RactorRuntime>`. | `dstate`, `ractor`, `ractor_cluster` |
 | `dstate-kameo` | Kameo adapter. Same role as `dstate-ractor` but for the kameo framework. | `dstate`, `kameo` |
 | `dstate-actix` | Actix adapter. Same role, targeting actix + a custom cluster messaging layer. | `dstate`, `actix`, `actix-broker` |
@@ -1186,9 +1155,9 @@ dstate/
 │   ├── traits/
 │   │   ├── mod.rs
 │   │   ├── state.rs        // DistributedState, DeltaDistributedState traits
-│   │   ├── runtime.rs      // ActorRuntime, ActorRef, ProcessingGroup,
-│   │   │                   //   ClusterEvents, TimerHandle traits
-│   │   ├── persistence.rs  // StatePersistence trait (async load/save)
+│   │   ├── runtime.rs      // ActorRuntime (incl. group ops), ActorRef,
+│   │   │                   //   ClusterEvents, TimerHandle, SubscriptionId
+│   │   ├── persistence.rs  // StatePersistence trait (saves StateObject<S>)
 │   │   └── clock.rs        // Clock trait, SystemClock, TestClock
 │   ├── types/
 │   │   ├── mod.rs
@@ -1196,8 +1165,8 @@ dstate/
 │   │   ├── sync_message.rs // SyncMessage, ChangeNotification, BatchedChangeFeed
 │   │   ├── config.rs       // StateConfig, SyncStrategy, PushMode, ChangeFeedConfig
 │   │   ├── errors.rs       // RegistryError, QueryError, MutationError,
-│   │   │                   //   ActorSendError, ActorRequestError, etc.
-│   │   └── node.rs         // NodeId, SyncUrgency, VersionMismatchPolicy
+│   │   │                   //   DeserializeError
+│   │   └── node.rs         // NodeId, VersionMismatchPolicy
 │   ├── core/
 │   │   ├── mod.rs
 │   │   ├── shard_core.rs   // ShardCore — pure state machine logic
@@ -1225,6 +1194,73 @@ dstate/
 no dependency on any actor runtime. The adapter crate's job is to wire these
 pure structs into framework-specific actor shells. This keeps the core
 unit-testable without any framework overhead.
+
+#### Public API Surface — Least Exposure Principle
+
+The `dstate` core crate follows the **least exposure** principle: only types
+and traits that downstream consumers (application code or adapter crates)
+need are publicly exported. Internal implementation details are kept
+`pub(crate)` or private.
+
+**lib.rs re-exports — the only public surface:**
+
+```rust
+// ── Traits (what users implement) ───────────────────────────────
+pub use traits::state::{DistributedState, DeltaDistributedState, SyncUrgency};
+pub use traits::runtime::{
+    ActorRuntime, ActorRef, ClusterEvents, TimerHandle, ClusterEvent, SubscriptionId,
+};
+pub use traits::persistence::{StatePersistence, PersistError};
+pub use traits::clock::{Clock, SystemClock};
+
+// ── Types (what users construct / receive) ──────────────────────
+pub use types::envelope::{StateObject, StateViewObject};
+pub use types::config::{StateConfig, SyncStrategy, PushMode, ChangeFeedConfig};
+pub use types::node::{NodeId, VersionMismatchPolicy};
+pub use types::errors::{
+    RegistryError, QueryError, MutationError, DeserializeError,
+};
+pub use traits::runtime::{
+    ActorSendError, GroupError, ClusterError,
+};
+pub use types::sync_message::{SyncMessage, ChangeNotification, BatchedChangeFeed};
+
+// ── Test support (feature-gated or cfg(test)) ───────────────────
+pub mod test_support;  // TestClock, InMemoryPersistence, FailingPersistence, TestRuntime
+```
+
+**Visibility rules by module:**
+
+| Module | Visibility | Rationale |
+|---|---|---|
+| `traits/` | Items re-exported via `lib.rs` | Traits are the contract — users implement or consume them |
+| `types/` | Items re-exported via `lib.rs` | Users construct configs, match on errors, send messages |
+| `core/` | `pub(crate)` | Pure logic — only adapter crates and `registry.rs` use it internally. Not exposed to application code. |
+| `messages/` | `pub(crate)` | Message enums are internal plumbing between actors. Adapter crates import them to wire actors but application code never touches them. |
+| `registry.rs` | `StateRegistry` re-exported via `lib.rs` | The registry is the user-facing entry point for registration |
+| `test_support/` | `pub` (entire module) | Must be accessible to adapter crates for conformance testing and to application tests for `TestCluster` |
+
+**What is NOT public:**
+
+- `core::shard_core::ShardCore` — internal state machine, only used by
+  adapter actor shells
+- `core::sync_logic`, `core::change_feed`, `core::versioning` — internal
+  decision logic
+- `messages::shard_msg`, `messages::sync_msg`, `messages::feed_msg` —
+  internal message envelopes between actors
+- Individual `traits/` and `types/` submodule paths (e.g.,
+  `dstate::traits::state::DistributedState` works but the preferred import
+  is `dstate::DistributedState`)
+
+**Adapter crates** (e.g., `dstate-ractor`) re-export the entire public API
+from `dstate` so that application code only needs a single dependency:
+
+```rust
+// In dstate-ractor/src/lib.rs:
+pub use dstate::*;
+pub use runtime::RactorRuntime;
+pub use actors::{StateShardActor, SyncEngineActor, ChangeFeedActor};
+```
 
 | Module | Contains | Depends on actor runtime? |
 |---|---|---|
@@ -1262,12 +1298,12 @@ concrete APIs:
 | Abstract Trait | Ractor Implementation |
 |---|---|
 | `ActorRef<M>::send()` | `ractor::ActorRef::cast()` |
-| `ActorRef<M>::request()` | `ractor::ActorRef::call()` with `RpcReplyPort` |
-| `ProcessingGroup::join()` | `ractor::pg::join(group, actor_ref)` |
-| `ProcessingGroup::leave()` | `ractor::pg::leave(group, actor_ref)` |
-| `ProcessingGroup::broadcast()` | `ractor::pg::broadcast(group, msg)` |
-| `ProcessingGroup::get_members()` | `ractor::pg::get_members(group)` |
+| `ActorRuntime::join_group()` | `ractor::pg::join(group, actor_ref)` |
+| `ActorRuntime::leave_group()` | `ractor::pg::leave(group, actor_ref)` |
+| `ActorRuntime::broadcast_group()` | `ractor::pg::broadcast(group, msg)` |
+| `ActorRuntime::get_group_members()` | `ractor::pg::get_members(group)` |
 | `ClusterEvents::subscribe()` | Subscribe to `ractor_cluster` membership events |
+| `ClusterEvents::unsubscribe()` | Remove membership event callback |
 | `ActorRuntime::spawn()` | `ractor::Actor::spawn()` wrapping handler in `impl Actor` |
 | `ActorRuntime::send_interval()` | `ractor::Actor::send_interval()` |
 | `ActorRuntime::send_after()` | `ractor::Actor::send_after()` |
@@ -1275,7 +1311,7 @@ concrete APIs:
 
 ```rust
 // In dstate-ractor/src/runtime.rs
-use dstate::{ActorRuntime, ActorRef, ProcessingGroup, ClusterEvents, TimerHandle};
+use dstate::{ActorRuntime, ActorRef, ClusterEvents, TimerHandle};
 
 pub struct RactorRuntime {
     // Holds cluster connection state for ractor_cluster
@@ -1283,7 +1319,6 @@ pub struct RactorRuntime {
 
 impl ActorRuntime for RactorRuntime {
     type Ref<M: Send + 'static> = ractor::ActorRef<M>;
-    type Group = RactorProcessingGroup;
     type Events = RactorClusterEvents;
     type Timer = RactorTimerHandle;
 
@@ -1351,9 +1386,8 @@ dstate-kameo/
 │   │   │                   //   (broadcasting via PubSub actor)
 │   │   └── feed_actor.rs   // impl Message<ChangeFeedMsg> for ChangeFeedActor
 │   │                       //   (wraps change_feed logic)
-│   ├── group.rs            // KameoProcessingGroup: impl ProcessingGroup
-│   │                       //   (uses PubSub<M> actor for broadcast,
-│   │                       //    actor registry for get_members)
+│   ├── group.rs            // Group operations implemented inside
+│   │                       //   KameoRuntime using PubSub<M> actors
 │   └── cluster.rs          // KameoClusterEvents: impl ClusterEvents
 │                           //   (subscribes to ActorSwarm peer events)
 ```
@@ -1363,12 +1397,12 @@ dstate-kameo/
 | Abstract Trait | Kameo Implementation |
 |---|---|
 | `ActorRef<M>::send()` | `kameo::ActorRef::tell()` |
-| `ActorRef<M>::request()` | `kameo::ActorRef::ask()` with timeout |
-| `ProcessingGroup::join()` | `pubsub_ref.tell(Subscribe::new(actor_ref.recipient()))` |
-| `ProcessingGroup::leave()` | `pubsub_ref.tell(Unsubscribe::new(actor_ref.recipient()))` |
-| `ProcessingGroup::broadcast()` | `pubsub_ref.tell(Publish::new(msg))` |
-| `ProcessingGroup::get_members()` | Query internal `Vec<ActorRef>` on the `PubSub` actor |
+| `ActorRuntime::join_group()` | `pubsub_ref.tell(Subscribe::new(actor_ref.recipient()))` |
+| `ActorRuntime::leave_group()` | `pubsub_ref.tell(Unsubscribe::new(actor_ref.recipient()))` |
+| `ActorRuntime::broadcast_group()` | `pubsub_ref.tell(Publish::new(msg))` |
+| `ActorRuntime::get_group_members()` | Query internal `Vec<ActorRef>` on the `PubSub` actor |
 | `ClusterEvents::subscribe()` | Subscribe to `ActorSwarm` peer discovery/disconnect events |
+| `ClusterEvents::unsubscribe()` | Remove peer event callback |
 | `ActorRuntime::spawn()` | `A::spawn(initial_state)` with `#[derive(Actor)]` wrapper |
 | `ActorRuntime::send_interval()` | Spawn a `tokio::task` that calls `tell()` on an interval |
 | `ActorRuntime::send_after()` | `tokio::spawn(async { tokio::time::sleep(d).await; ref_.tell(msg) })` |
@@ -1378,53 +1412,21 @@ dstate-kameo/
 
 Kameo does not have a built-in processing group equivalent to ractor's `pg`
 module. The `dstate-kameo` adapter bridges this gap using **one `PubSub<M>`
-actor per group name**:
+actor per group name**, managed internally by `KameoRuntime`:
 
 ```rust
 use kameo::actor::Spawn;
 use kameo_actors::pubsub::{PubSub, Subscribe, Unsubscribe, Publish};
 
-pub struct KameoProcessingGroup {
+pub struct KameoRuntime {
     /// group_name → PubSub actor ref
     groups: HashMap<String, kameo::ActorRef<PubSub<Vec<u8>>>>,
-}
-
-impl ProcessingGroup for KameoProcessingGroup {
-    type MemberRef = kameo::ActorRef<SyncEngineMsg>;
-
-    fn join(&self, group_name: &str) -> Result<(), GroupError> {
-        let pubsub = self.groups
-            .entry(group_name.to_string())
-            .or_insert_with(|| PubSub::spawn(PubSub::default()));
-        pubsub.tell(Subscribe::new(self_ref.recipient()))
-            .map_err(|_| GroupError::NetworkError("subscribe failed".into()))
-    }
-
-    fn broadcast<M: Send + Clone + 'static>(
-        &self,
-        group_name: &str,
-        msg: M,
-    ) -> Result<(), GroupError> {
-        let pubsub = self.groups.get(group_name)
-            .ok_or(GroupError::GroupNotFound)?;
-        let bytes = serialize_message(&msg);
-        pubsub.tell(Publish::new(bytes))
-            .map_err(|_| GroupError::NetworkError("publish failed".into()))
-    }
-
-    fn get_members(
-        &self,
-        group_name: &str,
-    ) -> Result<Vec<Self::MemberRef>, GroupError> {
-        // Ask the PubSub actor for its current subscriber list
-        let pubsub = self.groups.get(group_name)
-            .ok_or(GroupError::GroupNotFound)?;
-        // PubSub internally tracks subscribers; we query via a custom message
-        todo!("query subscriber list from PubSub actor")
-    }
-
     // ...
 }
+
+// Group operations are part of ActorRuntime — no separate ProcessingGroup trait.
+// KameoRuntime implements join_group/leave_group/broadcast_group/get_group_members
+// by delegating to the PubSub actors stored in self.groups.
 ```
 
 For **distributed** broadcasting (cross-node), the `PubSub` actor is
@@ -1521,9 +1523,8 @@ tokio        = { version = "1", features = ["time", "rt"] }
 ### 6.0.6 Architecture Overview
 
 The following actors compose the system. All actors are spawned through the
-`ActorRuntime` trait and communicate via `ActorRef::send()` (fire-and-forget)
-and `ActorRef::request()` (request-reply). Broadcasting uses the
-`ProcessingGroup` trait.
+`ActorRuntime` trait and communicate via `ActorRef::send()` (fire-and-forget).
+Broadcasting uses `ActorRuntime::broadcast_group()`.
 
 ```mermaid
 graph TD
@@ -3300,15 +3301,15 @@ pub enum QueryError {
     StalePeer { node_id: NodeId, last_synced: i64 },
     /// The state is not registered or the type does not match.
     Registry(RegistryError),
-    /// Internal communication error (actor unavailable, timeout, etc.).
-    ActorError(ActorRequestError),
+    /// Internal communication error (actor unavailable, etc.).
+    ActorError(ActorSendError),
 }
 
 pub enum MutationError {
     /// Persistence failed.
     PersistenceFailed(PersistError),
-    /// Internal communication error (actor unavailable, timeout, etc.).
-    ActorError(ActorRequestError),
+    /// Internal communication error (actor unavailable, etc.).
+    ActorError(ActorSendError),
 }
 
 impl From<RegistryError> for QueryError {

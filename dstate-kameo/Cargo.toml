@@ -1,0 +1,9 @@
+[package]
+name = "dstate-kameo"
+version = "0.1.0"
+edition = "2021"
+description = "Kameo adapter for the dstate distributed state crate"
+license = "MIT"
+
+[dependencies]
+dstate = { path = "../dstate" }

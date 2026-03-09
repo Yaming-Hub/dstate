@@ -1,0 +1,3 @@
+[workspace]
+members = ["dstate", "dstate-ractor", "dstate-kameo"]
+resolver = "2"
