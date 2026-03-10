@@ -5,6 +5,12 @@ use crate::types::sync_message::{BatchedChangeFeed, ChangeNotification};
 
 /// Pure state machine for change feed notification batching and deduplication.
 ///
+/// # Threading model
+///
+/// This struct is **not `Send`/`Sync`** by design. It is owned exclusively by
+/// a single actor (`ChangeFeedAggregator`) and accessed sequentially within
+/// that actor's message loop — no internal locking is needed.
+///
 /// # Ownership and Data Flow
 ///
 /// `ChangeFeedLogic` is owned by the **ChangeFeedAggregator actor** (one per

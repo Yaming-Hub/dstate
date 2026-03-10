@@ -21,8 +21,63 @@ pub(crate) enum SyncAction {
 
 /// Pure logic for outbound synchronization decisions.
 ///
-/// Given a `SyncStrategy` and a `SyncUrgency` per mutation, determines
-/// what action the actor shell should take (broadcast, notify, delay, suppress).
+/// Given a [`SyncStrategy`] and a [`SyncUrgency`] per mutation, determines
+/// what [`SyncAction`] the actor shell should take (broadcast, notify, delay,
+/// suppress).
+///
+/// # Threading model
+///
+/// This struct is owned exclusively by a single `StateShard` actor and accessed
+/// sequentially within that actor's message loop — no internal locking is needed.
+///
+/// # Ownership and Data Flow
+///
+/// Each `StateShard` actor owns exactly one `SyncLogic` instance, constructed
+/// from the state type's [`SyncStrategy`] at registration time. When a mutation
+/// is applied, the shard calls [`resolve_action`](Self::resolve_action) with the
+/// mutation's [`SyncUrgency`] to decide the outbound behavior:
+///
+/// ```text
+/// ┌──────────────────────────────────────────────────────────────────┐
+/// │ StateShard "counters"                                           │
+/// │                                                                  │
+/// │  apply_mutation(cmd)                                             │
+/// │    ├─ state.apply(cmd) → SyncUrgency                             │
+/// │    └─ SyncLogic.resolve_action(urgency) → SyncAction             │
+/// │         │                                                        │
+/// │         ├─ BroadcastDelta ──────► SyncEngine: push delta to all  │
+/// │         ├─ BroadcastSnapshot ───► SyncEngine: push full state    │
+/// │         ├─ NotifyChangeFeed ────► ChangeFeedAggregator: batch it │
+/// │         ├─ ScheduleDelayed(d) ──► actor timer: send after d      │
+/// │         └─ Suppress ────────────► (no-op, accumulate delta)      │
+/// └──────────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// # Decision matrix
+///
+/// The resolved action depends on the combination of `SyncUrgency` (per
+/// mutation) and `SyncStrategy.push_mode` (per state type):
+///
+/// | `SyncUrgency` | `push_mode = ActivePush` | `push_mode = ActiveFeedLazyPull` | `push_mode = None` |
+/// |---------------|--------------------------|----------------------------------|---------------------|
+/// | `Immediate`   | Broadcast (delta/snap)   | Broadcast (delta/snap)           | Broadcast (delta/snap) |
+/// | `Default`     | Broadcast (delta/snap)   | NotifyChangeFeed                 | Suppress            |
+/// | `Delayed(d)`  | ScheduleDelayed(d)       | ScheduleDelayed(d)               | ScheduleDelayed(d)  |
+/// | `Suppress`    | Suppress                 | Suppress                         | Suppress            |
+///
+/// `Immediate` always broadcasts regardless of strategy. `Delayed` and
+/// `Suppress` also ignore the push mode. Only `Default` consults `push_mode`.
+///
+/// Whether a broadcast sends a delta or a full snapshot depends on
+/// `supports_delta` (i.e. whether the state implements `DeltaDistributedState`).
+///
+/// # Who calls what
+///
+/// | Caller | Method | When |
+/// |--------|--------|------|
+/// | StateShard actor (after mutation) | `resolve_action()` | On every mutation to decide outbound sync |
+/// | StateShard actor (startup / config) | `strategy()` | To read the underlying `SyncStrategy` |
+/// | StateShard actor (timer setup) | `should_periodic_sync()` / `periodic_interval()` | To decide whether to arm a periodic full-sync timer |
 pub(crate) struct SyncLogic {
     state_name: String,
     strategy: SyncStrategy,

@@ -38,6 +38,7 @@ pub struct ChangeNotification {
 }
 
 /// A batched collection of change notifications broadcast by the aggregator.
+/// No target node is specified because this message is broadcast to all nodes in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchedChangeFeed {
     pub source_node: NodeId,
