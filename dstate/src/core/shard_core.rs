@@ -256,6 +256,10 @@ where
             if !accept {
                 return None;
             }
+            // Only clear pending_remote_generation if we've caught up.
+            let pending = existing
+                .and_then(|e| e.pending_remote_generation)
+                .filter(|p| snap.generation < *p);
             Some(StateViewObject {
                 generation: snap.generation,
                 wire_version: snap.wire_version,
@@ -263,7 +267,7 @@ where
                 created_time: snap.created_time,
                 modified_time: snap.modified_time,
                 synced_at: now,
-                pending_remote_generation: None,
+                pending_remote_generation: pending,
                 source_node: source,
             })
         });
@@ -329,6 +333,11 @@ where
         let new_view = apply_fn(&existing.value);
         let now = self.clock.now();
 
+        // Only clear pending_remote_generation if we've caught up.
+        let pending = existing
+            .pending_remote_generation
+            .filter(|p| generation < *p);
+
         self.views.update(
             &source,
             StateViewObject {
@@ -338,7 +347,7 @@ where
                 created_time: existing.created_time,
                 modified_time: self.clock.unix_ms(),
                 synced_at: now,
-                pending_remote_generation: None,
+                pending_remote_generation: pending,
                 source_node: source,
             },
         );
@@ -377,14 +386,19 @@ where
 
     /// Handle a node joining the cluster.
     ///
-    /// Adds an empty placeholder entry for the new node if it doesn't
-    /// already exist. The `default_view` is the initial view value.
+    /// Adds a placeholder entry for the new node if it doesn't already exist.
+    /// The placeholder uses `Generation::zero()` (incarnation=0, age=0) which
+    /// is always less than any real generation (real incarnations use
+    /// `current_unix_time_ms()`). The entry is marked stale via
+    /// `pending_remote_generation` so the query path knows to pull.
     pub fn on_node_joined(&self, node_id: NodeId, default_view: V) {
         if node_id == self.node_id {
             return; // don't re-add ourselves
         }
 
         let now = self.clock.now();
+        // Mark as stale so query path triggers a pull for the real state.
+        let pending = Some(Generation::new(1, 0));
         self.views.insert_node(
             node_id,
             StateViewObject {
@@ -394,7 +408,7 @@ where
                 created_time: 0,
                 modified_time: 0,
                 synced_at: now,
-                pending_remote_generation: None,
+                pending_remote_generation: pending,
                 source_node: node_id,
             },
         );
@@ -551,7 +565,20 @@ mod tests {
         let default_view = TestState { counter: 0, label: String::new() };
         shard.on_node_joined(NodeId(2), default_view);
 
-        // No stale peers immediately.
+        // Peer is stale immediately after join (placeholder has pending_remote_generation).
+        assert_eq!(shard.stale_peers(Duration::from_secs(10)), vec![NodeId(2)]);
+
+        // Accept a snapshot to clear the stale marker.
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(2),
+            generation: Generation::new(1, 1),
+            wire_version: 1,
+            view: TestState { counter: 1, label: "synced".into() },
+            created_time: 1_000_000,
+            modified_time: 1_000_000,
+        });
+
+        // Now not stale (just synced).
         assert!(shard.stale_peers(Duration::from_secs(10)).is_empty());
 
         // Advance clock past staleness threshold.
@@ -1254,6 +1281,85 @@ mod tests {
 
         let snap = shard.snapshot();
         assert_eq!(snap[&NodeId(2)].pending_remote_generation, None);
+    }
+
+    // ── Partial catch-up preserves pending_remote_generation ────
+
+    #[test]
+    fn accept_snapshot_partial_catchup_preserves_pending() {
+        let clock = test_clock();
+        let shard = make_shard(clock);
+
+        let default_view = TestState { counter: 0, label: String::new() };
+        shard.on_node_joined(NodeId(2), default_view);
+        // Change feed says peer is at generation (1, 10).
+        shard.mark_stale(NodeId(2), 1, 10);
+
+        // Accept a delayed snapshot at generation (1, 6) — still behind.
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(2),
+            generation: Generation::new(1, 6),
+            wire_version: 1,
+            view: TestState { counter: 6, label: "partial".into() },
+            created_time: 1_000_000,
+            modified_time: 1_000_000,
+        });
+
+        let snap = shard.snapshot();
+        // pending_remote_generation should be preserved — we're not caught up yet.
+        assert_eq!(snap[&NodeId(2)].pending_remote_generation, Some(Generation::new(1, 10)));
+        assert_eq!(snap[&NodeId(2)].value.counter, 6);
+    }
+
+    // ── Delta partial catch-up preserves pending_remote_generation ──
+
+    #[test]
+    fn accept_delta_partial_catchup_preserves_pending() {
+        let clock = test_clock();
+        let shard = make_delta_shard(clock.clone());
+
+        let default_view = TestDeltaView { counter: 0, label: String::new() };
+        shard.on_node_joined(NodeId(2), default_view);
+
+        // Accept snapshot to establish baseline at (1, 5).
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(2),
+            generation: Generation::new(1, 5),
+            wire_version: 1,
+            view: TestDeltaView { counter: 5, label: "base".into() },
+            created_time: 1_000_000,
+            modified_time: 1_000_000,
+        });
+
+        // Change feed says peer is at (1, 10).
+        shard.mark_stale(NodeId(2), 1, 10);
+
+        // Apply delta advancing to (1, 6) — still behind (1, 10).
+        let result = shard.accept_inbound_delta(
+            NodeId(2), Generation::new(1, 6), 1,
+            |v| TestDeltaView { counter: v.counter + 1, label: v.label.clone() },
+        );
+        assert_eq!(result, DeltaAcceptResult::Applied);
+
+        let snap = shard.snapshot();
+        assert_eq!(snap[&NodeId(2)].pending_remote_generation, Some(Generation::new(1, 10)));
+    }
+
+    // ── on_node_joined marks placeholder as stale ──────────────
+
+    #[test]
+    fn node_joined_placeholder_is_stale() {
+        let clock = test_clock();
+        let shard = make_shard(clock);
+
+        let default_view = TestState { counter: 0, label: String::new() };
+        shard.on_node_joined(NodeId(2), default_view);
+
+        let snap = shard.snapshot();
+        let entry = snap.get(&NodeId(2)).unwrap();
+        // Placeholder should have pending_remote_generation set (marked stale).
+        assert!(entry.pending_remote_generation.is_some());
+        assert_eq!(entry.generation, Generation::zero());
     }
 
     // ── Additional: new_state_object helper ─────────────────────

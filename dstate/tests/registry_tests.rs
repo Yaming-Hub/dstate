@@ -87,7 +87,7 @@ fn reg_01_register_and_lookup() {
     let shard = TestShard::new("node_resource");
 
     registry
-        .register::<TestShard>(Box::new(shard))
+        .register(shard)
         .expect("registration should succeed");
 
     let found = registry.lookup("node_resource").expect("should find");
@@ -114,7 +114,7 @@ fn reg_03_lookup_typed_mismatch() {
     let shard = TestShard::new("my_state");
 
     registry
-        .register::<TestShard>(Box::new(shard))
+        .register(shard)
         .expect("should register");
 
     let result = registry.lookup_typed::<OtherShard>("my_state");
@@ -133,7 +133,7 @@ fn reg_04_lookup_typed_correct() {
     let shard = TestShard::new("my_state");
 
     registry
-        .register::<TestShard>(Box::new(shard))
+        .register(shard)
         .expect("should register");
 
     let found = registry
@@ -148,11 +148,11 @@ fn reg_04_lookup_typed_correct() {
 fn reg_04a_duplicate_name() {
     let mut registry = StateRegistry::new();
     registry
-        .register::<TestShard>(Box::new(TestShard::new("dup")))
+        .register(TestShard::new("dup"))
         .expect("first should succeed");
 
     let err = registry
-        .register::<TestShard>(Box::new(TestShard::new("dup")))
+        .register(TestShard::new("dup"))
         .unwrap_err();
     assert!(matches!(err, RegistryError::DuplicateName(_)));
 }
@@ -168,28 +168,28 @@ fn reg_05_broadcast_node_joined() {
     let j3 = Arc::new(AtomicU32::new(0));
 
     registry
-        .register::<TestShard>(Box::new(TestShard::with_counters(
+        .register(TestShard::with_counters(
             "s1",
             j1.clone(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicU32::new(0)),
-        )))
+        ))
         .unwrap();
     registry
-        .register::<TestShard>(Box::new(TestShard::with_counters(
+        .register(TestShard::with_counters(
             "s2",
             j2.clone(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicU32::new(0)),
-        )))
+        ))
         .unwrap();
     registry
-        .register::<TestShard>(Box::new(TestShard::with_counters(
+        .register(TestShard::with_counters(
             "s3",
             j3.clone(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicU32::new(0)),
-        )))
+        ))
         .unwrap();
 
     registry.broadcast_node_joined(NodeId(42));
@@ -209,20 +209,20 @@ fn reg_06_broadcast_node_left() {
     let l2 = Arc::new(AtomicU32::new(0));
 
     registry
-        .register::<TestShard>(Box::new(TestShard::with_counters(
+        .register(TestShard::with_counters(
             "s1",
             Arc::new(AtomicU32::new(0)),
             l1.clone(),
             Arc::new(AtomicU32::new(0)),
-        )))
+        ))
         .unwrap();
     registry
-        .register::<TestShard>(Box::new(TestShard::with_counters(
+        .register(TestShard::with_counters(
             "s2",
             Arc::new(AtomicU32::new(0)),
             l2.clone(),
             Arc::new(AtomicU32::new(0)),
-        )))
+        ))
         .unwrap();
 
     registry.broadcast_node_left(NodeId(7));
@@ -240,10 +240,10 @@ fn reg_07_len_and_state_names() {
     assert_eq!(registry.len(), 0);
 
     registry
-        .register::<TestShard>(Box::new(TestShard::new("alpha")))
+        .register(TestShard::new("alpha"))
         .unwrap();
     registry
-        .register::<TestShard>(Box::new(TestShard::new("beta")))
+        .register(TestShard::new("beta"))
         .unwrap();
 
     assert_eq!(registry.len(), 2);

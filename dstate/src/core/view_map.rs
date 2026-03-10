@@ -30,6 +30,15 @@ use crate::types::node::NodeId;
 ///   — O(1), no map clone.
 /// - **Write (node join/leave):** Clone the outer `HashMap` (cheap — only `Arc`
 ///   pointer bumps), insert/remove, then atomic swap of the outer `ArcSwap`.
+///
+/// # Writer Safety
+///
+/// All write methods (`update`, `insert_node`, `remove_node`, `upsert`,
+/// `update_if`) use load-then-store (not CAS). This is safe because all
+/// writes are serialized through the `StateShard` actor mailbox — there is
+/// exactly one writer at a time. The `ArcSwap` serves the read path
+/// (lock-free atomic loads from any thread), not for multi-writer
+/// concurrency.
 #[allow(dead_code)]
 pub(crate) struct ViewMap<V>
 where

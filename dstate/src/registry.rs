@@ -45,21 +45,22 @@ impl StateRegistry {
 
     /// Register a state shard.
     ///
-    /// The type parameter `S` is used to record the concrete shard type
-    /// for later typed lookups via `lookup_typed`.
+    /// The type parameter `S` must match the concrete type of the shard.
+    /// The `TypeId` is derived from `S` for later typed lookups via
+    /// `lookup_typed`.
     ///
     /// Returns `Err(RegistryError::DuplicateName)` if a shard with the
     /// same name is already registered.
-    pub fn register<S: 'static>(
+    pub fn register<S: AnyStateShard>(
         &mut self,
-        shard: Box<dyn AnyStateShard>,
+        shard: S,
     ) -> Result<(), RegistryError> {
         let name = shard.state_name().to_string();
         if self.shards.contains_key(&name) {
             return Err(RegistryError::DuplicateName(name));
         }
         let type_id = TypeId::of::<S>();
-        self.shards.insert(name, (type_id, shard));
+        self.shards.insert(name, (type_id, Box::new(shard)));
         Ok(())
     }
 
