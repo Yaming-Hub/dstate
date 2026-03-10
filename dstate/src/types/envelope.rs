@@ -1,12 +1,12 @@
 use std::time::Instant;
 
-use crate::types::node::{NodeId, StateVersion};
+use crate::types::node::{NodeId, Generation};
 
 /// The local node's authoritative copy of a distributed state.
 #[derive(Debug, Clone)]
 pub struct StateObject<S> {
     /// The logical version (incarnation + age) of this state.
-    pub version: StateVersion,
+    pub version: Generation,
     /// The storage format version used when this state was persisted.
     pub storage_version: u32,
     /// The state value.
@@ -33,7 +33,7 @@ impl<S> StateObject<S> {
 #[derive(Debug, Clone)]
 pub struct StateViewObject<V> {
     /// The logical version (incarnation + age) of this view.
-    pub version: StateVersion,
+    pub version: Generation,
     /// The wire protocol version used to serialize this view.
     pub wire_version: u32,
     /// The view value.
@@ -46,7 +46,7 @@ pub struct StateViewObject<V> {
     pub synced_at: Instant,
     /// If set, the peer has announced a newer version via a change feed
     /// notification, meaning this view is known to be stale.
-    pub pending_remote_version: Option<StateVersion>,
+    pub pending_remote_version: Option<Generation>,
     /// The node that owns this view.
     pub source_node: NodeId,
 }

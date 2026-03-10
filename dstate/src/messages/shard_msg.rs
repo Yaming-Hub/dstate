@@ -1,5 +1,5 @@
 use crate::types::errors::MutationError;
-use crate::types::node::{NodeId, StateVersion};
+use crate::types::node::{NodeId, Generation};
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -14,7 +14,7 @@ pub(crate) enum SimpleShardMsg<S: Clone + Send + 'static> {
     /// Inbound full snapshot from a peer (via SyncEngine).
     InboundSnapshot {
         source: NodeId,
-        version: StateVersion,
+        version: Generation,
         wire_version: u32,
         data: Vec<u8>,
     },
@@ -25,7 +25,7 @@ pub(crate) enum SimpleShardMsg<S: Clone + Send + 'static> {
     /// ChangeFeed reports a peer has newer data.
     MarkStale {
         source: NodeId,
-        version: StateVersion,
+        version: Generation,
     },
 }
 
@@ -84,7 +84,7 @@ where
     /// Inbound full snapshot from a peer (via SyncEngine).
     InboundSnapshot {
         source: NodeId,
-        version: StateVersion,
+        version: Generation,
         wire_version: u32,
         data: Vec<u8>,
     },
@@ -102,7 +102,7 @@ where
     /// ChangeFeed reports a peer has newer data.
     MarkStale {
         source: NodeId,
-        version: StateVersion,
+        version: Generation,
     },
     /// Carries the `V` and `VD` type parameters.
     #[doc(hidden)]

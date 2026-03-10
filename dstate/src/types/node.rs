@@ -23,14 +23,14 @@ impl fmt::Display for NodeId {
 /// (inc=1, age=5) == (inc=1, age=5)    // duplicate
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StateVersion {
+pub struct Generation {
     /// Unique lifetime identifier; changes on crash-restart without persistence.
     pub incarnation: u64,
     /// Monotonically increasing mutation counter within an incarnation.
     pub age: u64,
 }
 
-impl StateVersion {
+impl Generation {
     /// Create a new version.
     pub fn new(incarnation: u64, age: u64) -> Self {
         Self { incarnation, age }
@@ -50,13 +50,13 @@ impl StateVersion {
     }
 }
 
-impl PartialOrd for StateVersion {
+impl PartialOrd for Generation {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for StateVersion {
+impl Ord for Generation {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.incarnation
             .cmp(&other.incarnation)
@@ -64,7 +64,7 @@ impl Ord for StateVersion {
     }
 }
 
-impl fmt::Display for StateVersion {
+impl fmt::Display for Generation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "v{}:{}", self.incarnation, self.age)
     }

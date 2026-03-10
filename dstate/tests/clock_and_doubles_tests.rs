@@ -2,7 +2,7 @@
 /// TEST-08..TEST-10: Test doubles tests
 use std::time::Duration;
 
-use dstate::{Clock, StateObject, StateVersion, StatePersistence};
+use dstate::{Clock, StateObject, Generation, StatePersistence};
 use dstate::test_support::test_clock::TestClock;
 use dstate::test_support::test_persist::{FailingPersistence, InMemoryPersistence};
 
@@ -58,7 +58,7 @@ fn test_04_freshness_check_uses_clock() {
 async fn test_08_in_memory_persistence_round_trip() {
     let persist = InMemoryPersistence::<String>::new();
     let state = StateObject {
-        version: StateVersion::new(1, 5),
+        version: Generation::new(1, 5),
         storage_version: 1,
         value: "hello world".to_string(),
         created_time: 1000,
@@ -78,7 +78,7 @@ async fn test_08_in_memory_persistence_round_trip() {
 async fn test_09_failing_persistence_always_returns_error() {
     let persist = FailingPersistence;
     let state = StateObject {
-        version: StateVersion::new(1, 0),
+        version: Generation::new(1, 0),
         storage_version: 1,
         value: "test".to_string(),
         created_time: 0,
