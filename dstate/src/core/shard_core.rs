@@ -3,8 +3,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-
+use crate::core::view_map::ViewMap;
 use crate::traits::clock::Clock;
 use crate::types::envelope::{StateObject, StateViewObject};
 use crate::types::node::NodeId;
@@ -68,9 +67,18 @@ pub(crate) enum DeltaAcceptResult {
 /// Pure state machine managing one distributed state shard on a single node.
 ///
 /// `ShardCore` holds the owned `StateObject<S>` and the cluster-wide
-/// `PublicViewMap` (an `ArcSwap<HashMap<NodeId, StateViewObject<V>>>`).
-/// It implements all ordering, mutation, and view-map logic without
-/// depending on any actor framework.
+/// view map (a per-node `ArcSwap` structure). It implements all ordering,
+/// mutation, and view-map logic without depending on any actor framework.
+///
+/// # View Map Concurrency
+///
+/// The view map uses a two-level `ArcSwap` design:
+/// - Outer: `ArcSwap<HashMap<NodeId, Arc<ArcSwap<StateViewObject<V>>>>>`
+///   — swapped only on node join/leave (rare).
+/// - Inner (per-node): `ArcSwap<StateViewObject<V>>` — swapped on every
+///   snapshot/delta update (frequent), O(1) with no map cloning.
+///
+/// Read path is fully lock-free (two atomic pointer loads).
 ///
 /// - For simple states (`DistributedState`): `S == V`.
 /// - For delta states (`DeltaDistributedState`): `V = D::View`.
@@ -82,7 +90,7 @@ where
 {
     node_id: NodeId,
     state: StateObject<S>,
-    view_map: Arc<ArcSwap<HashMap<NodeId, StateViewObject<V>>>>,
+    views: ViewMap<V>,
     clock: Arc<dyn Clock>,
 }
 
@@ -103,28 +111,24 @@ where
         clock: Arc<dyn Clock>,
     ) -> Self {
         let now = clock.now();
-        let mut map = HashMap::new();
-        map.insert(
-            node_id,
-            StateViewObject {
-                age: state.age,
-                incarnation: state.incarnation,
-                wire_version: state.storage_version,
-                value: initial_view,
-                created_time: state.created_time,
-                modified_time: state.modified_time,
-                synced_at: now,
-                pending_remote_age: None,
-                pending_remote_incarnation: None,
-                source_node: node_id,
-            },
-        );
-        let view_map = Arc::new(ArcSwap::from_pointee(map));
+        let initial_vo = StateViewObject {
+            age: state.age,
+            incarnation: state.incarnation,
+            wire_version: state.storage_version,
+            value: initial_view,
+            created_time: state.created_time,
+            modified_time: state.modified_time,
+            synced_at: now,
+            pending_remote_age: None,
+            pending_remote_incarnation: None,
+            source_node: node_id,
+        };
+        let views = ViewMap::new(node_id, initial_vo);
 
         Self {
             node_id,
             state,
-            view_map,
+            views,
             clock,
         }
     }
@@ -146,14 +150,19 @@ where
         &mut self.state
     }
 
-    /// A clone-able handle to the view map for lock-free reads.
-    pub fn view_map(&self) -> &Arc<ArcSwap<HashMap<NodeId, StateViewObject<V>>>> {
-        &self.view_map
+    /// Read a single node's view. Lock-free O(1).
+    pub fn get_view(&self, node_id: &NodeId) -> Option<Arc<StateViewObject<V>>> {
+        self.views.get(node_id)
     }
 
-    /// Load a snapshot of the current view map.
-    pub fn snapshot(&self) -> Arc<HashMap<NodeId, StateViewObject<V>>> {
-        Arc::clone(&self.view_map.load())
+    /// Collect a full snapshot of all views. Lock-free but O(n).
+    pub fn snapshot(&self) -> HashMap<NodeId, StateViewObject<V>> {
+        self.views.snapshot()
+    }
+
+    /// Number of nodes in the view map.
+    pub fn view_count(&self) -> usize {
+        self.views.len()
     }
 
     // ── Ordering ────────────────────────────────────────────────
@@ -248,23 +257,18 @@ where
     /// Uses `should_accept` to compare against the peer's existing entry
     /// (if any). A peer with no existing entry is always accepted.
     pub fn accept_inbound_snapshot(&self, snap: InboundSnapshot<V>) -> AcceptResult {
-        let guard = self.view_map.load();
-        let accept = match guard.get(&snap.source) {
-            Some(existing) => {
-                Self::should_accept(snap.incarnation, snap.age, existing.incarnation, existing.age)
-            }
-            None => true,
-        };
-
-        if !accept {
-            return AcceptResult::Discarded;
-        }
-
         let now = self.clock.now();
-        let mut new_map = (**guard).clone();
-        new_map.insert(
-            snap.source,
-            StateViewObject {
+        let source = snap.source;
+
+        let accepted = self.views.update_if(&source, |existing| {
+            let accept = match existing {
+                Some(e) => Self::should_accept(snap.incarnation, snap.age, e.incarnation, e.age),
+                None => true,
+            };
+            if !accept {
+                return None;
+            }
+            Some(StateViewObject {
                 age: snap.age,
                 incarnation: snap.incarnation,
                 wire_version: snap.wire_version,
@@ -274,12 +278,15 @@ where
                 synced_at: now,
                 pending_remote_age: None,
                 pending_remote_incarnation: None,
-                source_node: snap.source,
-            },
-        );
-        self.view_map.store(Arc::new(new_map));
+                source_node: source,
+            })
+        });
 
-        AcceptResult::Accepted
+        if accepted {
+            AcceptResult::Accepted
+        } else {
+            AcceptResult::Discarded
+        }
     }
 
     // ── Inbound delta ───────────────────────────────────────────
@@ -302,8 +309,7 @@ where
     where
         AF: FnOnce(&V) -> V,
     {
-        let guard = self.view_map.load();
-        let existing = match guard.get(&source) {
+        let existing = match self.views.get(&source) {
             Some(e) => e,
             None => return DeltaAcceptResult::UnknownPeer,
         };
@@ -335,9 +341,8 @@ where
         let new_view = apply_fn(&existing.value);
         let now = self.clock.now();
 
-        let mut new_map = (**guard).clone();
-        new_map.insert(
-            source,
+        self.views.update(
+            &source,
             StateViewObject {
                 age: to_age,
                 incarnation,
@@ -351,7 +356,6 @@ where
                 source_node: source,
             },
         );
-        self.view_map.store(Arc::new(new_map));
 
         DeltaAcceptResult::Applied
     }
@@ -361,19 +365,7 @@ where
     /// Return peers whose views are stale (not synced within `max_staleness`
     /// or have a `pending_remote_age`/`pending_remote_incarnation`).
     pub fn stale_peers(&self, max_staleness: Duration) -> Vec<NodeId> {
-        let guard = self.view_map.load();
-        let now = self.clock.now();
-
-        guard
-            .iter()
-            .filter(|(id, _)| **id != self.node_id)
-            .filter(|(_, vo)| {
-                vo.pending_remote_age.is_some()
-                    || vo.pending_remote_incarnation.is_some()
-                    || now.duration_since(vo.synced_at) > max_staleness
-            })
-            .map(|(id, _)| *id)
-            .collect()
+        self.views.stale_peers(self.node_id, max_staleness, self.clock.as_ref())
     }
 
     /// Mark a peer's view as stale based on a change-feed notification.
@@ -381,33 +373,28 @@ where
     /// Sets `pending_remote_age` and/or `pending_remote_incarnation` if the
     /// incoming values are newer than the current entry.
     pub fn mark_stale(&self, source: NodeId, incarnation: u64, age: u64) {
-        let guard = self.view_map.load();
-        let existing = match guard.get(&source) {
-            Some(e) => e,
-            None => return, // unknown peer — ignore
-        };
+        self.views.update_if(&source, |existing| {
+            let existing = existing?;
 
-        let should_mark = if incarnation > existing.incarnation {
-            true
-        } else if incarnation == existing.incarnation {
-            age > existing.age
-        } else {
-            false
-        };
+            let should_mark = if incarnation > existing.incarnation {
+                true
+            } else if incarnation == existing.incarnation {
+                age > existing.age
+            } else {
+                false
+            };
 
-        if !should_mark {
-            return;
-        }
+            if !should_mark {
+                return None;
+            }
 
-        let mut updated = existing.clone();
-        if incarnation > existing.incarnation {
-            updated.pending_remote_incarnation = Some(incarnation);
-        }
-        updated.pending_remote_age = Some(age);
-
-        let mut new_map = (**guard).clone();
-        new_map.insert(source, updated);
-        self.view_map.store(Arc::new(new_map));
+            let mut updated = existing.clone();
+            if incarnation > existing.incarnation {
+                updated.pending_remote_incarnation = Some(incarnation);
+            }
+            updated.pending_remote_age = Some(age);
+            Some(updated)
+        });
     }
 
     // ── Cluster events ──────────────────────────────────────────
@@ -421,14 +408,8 @@ where
             return; // don't re-add ourselves
         }
 
-        let guard = self.view_map.load();
-        if guard.contains_key(&node_id) {
-            return; // already have an entry
-        }
-
         let now = self.clock.now();
-        let mut new_map = (**guard).clone();
-        new_map.insert(
+        self.views.insert_node(
             node_id,
             StateViewObject {
                 age: 0,
@@ -443,7 +424,6 @@ where
                 source_node: node_id,
             },
         );
-        self.view_map.store(Arc::new(new_map));
     }
 
     /// Handle a node leaving the cluster.
@@ -453,27 +433,17 @@ where
         if node_id == self.node_id {
             return; // don't remove ourselves
         }
-
-        let guard = self.view_map.load();
-        if !guard.contains_key(&node_id) {
-            return;
-        }
-
-        let mut new_map = (**guard).clone();
-        new_map.remove(&node_id);
-        self.view_map.store(Arc::new(new_map));
+        self.views.remove_node(&node_id);
     }
 
     // ── Helpers ─────────────────────────────────────────────────
 
-    /// Update the local node's own entry in the view map.
+    /// Update the local node's own entry in the view map. O(1) — just
+    /// an atomic swap on the per-node ArcSwap, no map cloning.
     fn update_own_view(&self, view: V) {
-        let guard = self.view_map.load();
         let now = self.clock.now();
-
-        let mut new_map = (**guard).clone();
-        new_map.insert(
-            self.node_id,
+        self.views.update(
+            &self.node_id,
             StateViewObject {
                 age: self.state.age,
                 incarnation: self.state.incarnation,
@@ -487,7 +457,6 @@ where
                 source_node: self.node_id,
             },
         );
-        self.view_map.store(Arc::new(new_map));
     }
 }
 
