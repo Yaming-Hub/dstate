@@ -5,9 +5,67 @@ use crate::types::sync_message::{BatchedChangeFeed, ChangeNotification};
 
 /// Pure state machine for change feed notification batching and deduplication.
 ///
-/// Collects `notify_change` calls from local state shards, deduplicates by
-/// `(state_name, source_node)` keeping the highest `Generation`, and produces
-/// a `BatchedChangeFeed` on `flush()`.
+/// # Ownership and Data Flow
+///
+/// `ChangeFeedLogic` is owned by the **ChangeFeedAggregator actor** (one per
+/// node, not per state type). The data flow is:
+///
+/// ```text
+/// ┌──────────────────────────────────────────────────────────────────┐
+/// │ LOCAL NODE                                                      │
+/// │                                                                  │
+/// │  StateShard "counters"                                           │
+/// │    └─ mutation → ShardCore.apply_mutation()                      │
+/// │         └─ SyncLogic.resolve_action(urgency)                     │
+/// │              ├─ BroadcastDelta → SyncEngine (direct push)        │
+/// │              └─ NotifyChangeFeed ──┐                             │
+/// │                                    ▼                             │
+/// │  StateShard "sessions"        ┌─────────────────────────┐        │
+/// │    └─ mutation ──────────────►│ ChangeFeedAggregator     │        │
+/// │                               │   (ChangeFeedLogic)     │        │
+/// │  StateShard "metrics"         │                         │        │
+/// │    └─ mutation ──────────────►│ notify_change("metrics") │        │
+/// │                               │ notify_change("sessions")│       │
+/// │                               │                         │        │
+/// │                               │ [timer: FlushTick]      │        │
+/// │                               │   └─ flush() ──────────────►     │
+/// │                               └─────────────────────────┘  broadcast
+/// │                                                            BatchedChangeFeed
+/// │                                                            to all peer nodes
+/// └──────────────────────────────────────────────────────────────────┘
+///
+/// ┌──────────────────────────────────────────────────────────────────┐
+/// │ REMOTE NODE                                                      │
+/// │                                                                  │
+/// │  ChangeFeedAggregator                                            │
+/// │    └─ receives BatchedChangeFeed                                 │
+/// │         └─ route_inbound_batch() → [(state_name, source, gen)]   │
+/// │              ├─ StateShard "counters" → mark_stale(source, gen)   │
+/// │              ├─ StateShard "sessions" → mark_stale(source, gen)   │
+/// │              └─ StateShard "metrics"  → mark_stale(source, gen)   │
+/// │                                                                  │
+/// │  Later, on query with freshness check:                           │
+/// │    StateShard sees pending_remote_generation → pulls real data    │
+/// └──────────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// # Who calls what
+///
+/// | Caller | Method | When |
+/// |--------|--------|------|
+/// | SyncEngine actor (via actor shell) | `notify_change()` | After mutation, when `SyncLogic` returns `NotifyChangeFeed` |
+/// | ChangeFeedAggregator timer | `flush()` | Every `batch_interval` (default 1s) |
+/// | ChangeFeedAggregator inbound handler | `route_inbound_batch()` | On receiving `BatchedChangeFeed` from a peer |
+///
+/// # Key invariants
+///
+/// - **One instance per node** (not per state type) — enables cross-state batching.
+/// - **source_node in notify_change** is always `self.node_id` for local mutations
+///   (the local node is the source of the change).
+/// - **Dedup by `(state_name, source_node)`**: if "counters" mutates 50 times
+///   between flushes, only the highest `Generation` is broadcast to peers.
+/// - **Self-message filtering**: `route_inbound_batch` ignores batches where
+///   `batch.source_node == self_node_id` (own broadcast received via group).
 pub(crate) struct ChangeFeedLogic {
     node_id: NodeId,
     /// Pending notifications: key = (state_name, source_node), value = highest generation seen.
