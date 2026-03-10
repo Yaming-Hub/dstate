@@ -9,7 +9,7 @@ pub use traits::clock::{Clock, SystemClock};
 // ── Types (what users construct / receive) ──────────────────────
 pub use types::envelope::{StateObject, StateViewObject};
 pub use types::config::{ChangeFeedConfig, PushMode, StateConfig, SyncStrategy};
-pub use types::node::{NodeId, VersionMismatchPolicy};
+pub use types::node::{NodeId, StateVersion, VersionMismatchPolicy};
 pub use types::errors::{
     DeserializeError, MutationError, QueryError, RegistryError,
 };

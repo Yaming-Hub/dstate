@@ -1,4 +1,4 @@
-use crate::types::node::NodeId;
+use crate::types::node::{NodeId, StateVersion};
 
 /// Outbound messages from StateShard to SyncEngine.
 #[derive(Debug)]
@@ -6,8 +6,7 @@ pub(crate) enum SyncEngineMsg {
     /// Broadcast a full snapshot to all peers.
     OutboundSnapshot {
         state_name: String,
-        incarnation: u64,
-        age: u64,
+        version: StateVersion,
         wire_version: u32,
         data: Vec<u8>,
     },
@@ -16,7 +15,6 @@ pub(crate) enum SyncEngineMsg {
         state_name: String,
         incarnation: u64,
         from_age: u64,
-        to_age: u64,
         wire_version: u32,
         data: Vec<u8>,
     },
