@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::node::NodeId;
+use crate::types::node::{NodeId, Generation};
 
 /// Wire-level synchronization messages exchanged between nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9,18 +9,16 @@ pub enum SyncMessage {
     FullSnapshot {
         state_name: String,
         source_node: NodeId,
-        incarnation: u64,
-        age: u64,
+        generation: Generation,
         wire_version: u32,
         data: Vec<u8>,
     },
-    /// An incremental delta update.
+    /// An incremental delta update. The delta advances the view
+    /// from `generation.age - 1` to `generation.age`.
     DeltaUpdate {
         state_name: String,
         source_node: NodeId,
-        incarnation: u64,
-        from_age: u64,
-        to_age: u64,
+        generation: Generation,
         wire_version: u32,
         data: Vec<u8>,
     },
@@ -28,7 +26,6 @@ pub enum SyncMessage {
     RequestSnapshot {
         state_name: String,
         requester: NodeId,
-        min_required_age: Option<u64>,
     },
 }
 
@@ -37,8 +34,7 @@ pub enum SyncMessage {
 pub struct ChangeNotification {
     pub state_name: String,
     pub source_node: NodeId,
-    pub incarnation: u64,
-    pub age: u64,
+    pub generation: Generation,
 }
 
 /// A batched collection of change notifications broadcast by the aggregator.

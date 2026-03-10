@@ -14,7 +14,7 @@ pub(crate) enum SimpleShardMsg<S: Clone + Send + 'static> {
     /// Inbound full snapshot from a peer (via SyncEngine).
     InboundSnapshot {
         source: NodeId,
-        version: Generation,
+        generation: Generation,
         wire_version: u32,
         data: Vec<u8>,
     },
@@ -25,7 +25,7 @@ pub(crate) enum SimpleShardMsg<S: Clone + Send + 'static> {
     /// ChangeFeed reports a peer has newer data.
     MarkStale {
         source: NodeId,
-        version: Generation,
+        generation: Generation,
     },
 }
 
@@ -35,24 +35,24 @@ impl<S: Clone + Send + 'static> fmt::Debug for SimpleShardMsg<S> {
             Self::Mutate { .. } => f.debug_struct("Mutate").finish_non_exhaustive(),
             Self::InboundSnapshot {
                 source,
-                version,
+                generation,
                 wire_version,
                 ..
             } => f
                 .debug_struct("InboundSnapshot")
                 .field("source", source)
-                .field("version", version)
+                .field("generation", generation)
                 .field("wire_version", wire_version)
                 .finish_non_exhaustive(),
             Self::NodeJoined(id) => f.debug_tuple("NodeJoined").field(id).finish(),
             Self::NodeLeft(id) => f.debug_tuple("NodeLeft").field(id).finish(),
             Self::MarkStale {
                 source,
-                version,
+                generation,
             } => f
                 .debug_struct("MarkStale")
                 .field("source", source)
-                .field("version", version)
+                .field("generation", generation)
                 .finish(),
         }
     }
@@ -84,14 +84,15 @@ where
     /// Inbound full snapshot from a peer (via SyncEngine).
     InboundSnapshot {
         source: NodeId,
-        version: Generation,
+        generation: Generation,
         wire_version: u32,
         data: Vec<u8>,
     },
-    /// Inbound delta update from a peer.
+    /// Inbound delta update from a peer. The delta advances the view
+    /// from `generation.age - 1` to `generation.age`.
     InboundDelta {
         source: NodeId,
-        from_age: u64,
+        generation: Generation,
         wire_version: u32,
         data: Vec<u8>,
     },
@@ -102,7 +103,7 @@ where
     /// ChangeFeed reports a peer has newer data.
     MarkStale {
         source: NodeId,
-        version: Generation,
+        generation: Generation,
     },
     /// Carries the `V` and `VD` type parameters.
     #[doc(hidden)]
@@ -124,35 +125,35 @@ where
             Self::Mutate { .. } => f.debug_struct("Mutate").finish_non_exhaustive(),
             Self::InboundSnapshot {
                 source,
-                version,
+                generation,
                 wire_version,
                 ..
             } => f
                 .debug_struct("InboundSnapshot")
                 .field("source", source)
-                .field("version", version)
+                .field("generation", generation)
                 .field("wire_version", wire_version)
                 .finish_non_exhaustive(),
             Self::InboundDelta {
                 source,
-                from_age,
+                generation,
                 wire_version,
                 ..
             } => f
                 .debug_struct("InboundDelta")
                 .field("source", source)
-                .field("from_age", from_age)
+                .field("generation", generation)
                 .field("wire_version", wire_version)
                 .finish_non_exhaustive(),
             Self::NodeJoined(id) => f.debug_tuple("NodeJoined").field(id).finish(),
             Self::NodeLeft(id) => f.debug_tuple("NodeLeft").field(id).finish(),
             Self::MarkStale {
                 source,
-                version,
+                generation,
             } => f
                 .debug_struct("MarkStale")
                 .field("source", source)
-                .field("version", version)
+                .field("generation", generation)
                 .finish(),
             Self::_Phantom(_) => unreachable!(),
         }

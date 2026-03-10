@@ -54,9 +54,9 @@ pub(crate) enum DeltaAcceptResult {
     Applied,
     /// The delta was discarded (stale or duplicate).
     Discarded,
-    /// There is a gap — the peer's from_age doesn't match our local age.
+    /// There is a gap — the delta's generation doesn't follow the local view.
     /// Caller should request a full snapshot.
-    GapDetected { expected: Generation, received_from_age: u64 },
+    GapDetected { local: Generation, incoming: Generation },
     /// The peer has no entry in the view map. Caller should request snapshot.
     UnknownPeer,
 }
@@ -279,17 +279,18 @@ where
 
     /// Accept or discard an inbound delta update from a peer.
     ///
-    /// - If the peer has no entry, returns `UnknownPeer`.
-    /// - If `from_age` doesn't match the peer's current age, returns `GapDetected`.
-    /// - If the delta is stale (from_age < current age), returns `Discarded`.
-    /// - Otherwise, applies `apply_fn` and updates the view map.
+    /// The `generation` is the generation *after* applying the delta
+    /// (i.e., the delta advances the view from `generation.age - 1` to
+    /// `generation.age`).
     ///
-    /// The new age after applying a delta is always `from_age + 1`.
+    /// - If the peer has no entry, returns `UnknownPeer`.
+    /// - If the generation doesn't follow the peer's current view, returns `GapDetected`.
+    /// - If stale (older incarnation or age), returns `Discarded`.
+    /// - Otherwise, applies `apply_fn` and updates the view map.
     pub fn accept_inbound_delta<AF>(
         &self,
         source: NodeId,
-        incarnation: u64,
-        from_age: u64,
+        generation: Generation,
         wire_version: u32,
         apply_fn: AF,
     ) -> DeltaAcceptResult
@@ -302,34 +303,36 @@ where
         };
 
         // Stale incarnation — discard.
-        if incarnation < existing.generation.incarnation {
+        if generation.incarnation < existing.generation.incarnation {
             return DeltaAcceptResult::Discarded;
         }
 
         // New incarnation — gap (need full snapshot).
-        if incarnation > existing.generation.incarnation {
+        if generation.incarnation > existing.generation.incarnation {
             return DeltaAcceptResult::GapDetected {
-                expected: existing.generation,
-                received_from_age: from_age,
+                local: existing.generation,
+                incoming: generation,
             };
         }
 
-        // Same incarnation: check age continuity.
-        if from_age != existing.generation.age {
+        // Same incarnation: delta must advance age by exactly 1.
+        if generation.age != existing.generation.age + 1 {
+            if generation.age <= existing.generation.age {
+                return DeltaAcceptResult::Discarded;
+            }
             return DeltaAcceptResult::GapDetected {
-                expected: existing.generation,
-                received_from_age: from_age,
+                local: existing.generation,
+                incoming: generation,
             };
         }
 
-        let to_age = from_age + 1;
         let new_view = apply_fn(&existing.value);
         let now = self.clock.now();
 
         self.views.update(
             &source,
             StateViewObject {
-                generation: Generation::new(incarnation, to_age),
+                generation,
                 wire_version,
                 value: new_view,
                 created_time: existing.created_time,
@@ -1082,8 +1085,9 @@ mod tests {
             modified_time: 1_000_000,
         });
 
+        // Delta advances from age 5 to age 6: generation = (1, 6).
         let result = shard.accept_inbound_delta(
-            NodeId(2), 1, 5, 1,
+            NodeId(2), Generation::new(1, 6), 1,
             |view| TestDeltaState::apply_delta(
                 view,
                 &TestDeltaViewDelta { counter_delta: 3, new_label: None },
@@ -1110,14 +1114,15 @@ mod tests {
             modified_time: 1_000_000,
         });
 
+        // Peer is at age 5 but delta claims generation (1, 8) — gap (skipped ages).
         let result = shard.accept_inbound_delta(
-            NodeId(2), 1, 3, 1,
+            NodeId(2), Generation::new(1, 8), 1,
             |_| unreachable!(),
         );
 
         assert_eq!(result, DeltaAcceptResult::GapDetected {
-            expected: Generation::new(1, 5),
-            received_from_age: 3,
+            local: Generation::new(1, 5),
+            incoming: Generation::new(1, 8),
         });
     }
 
@@ -1135,8 +1140,9 @@ mod tests {
             modified_time: 1_000_000,
         });
 
+        // Delta from old incarnation 1 but peer is at incarnation 2.
         let result = shard.accept_inbound_delta(
-            NodeId(2), 1, 9, 1,
+            NodeId(2), Generation::new(1, 10), 1,
             |_| unreachable!(),
         );
 
@@ -1149,7 +1155,7 @@ mod tests {
         let shard: ShardCore<TestDeltaStateInner, TestDeltaView> = make_delta_shard(clock);
 
         let result = shard.accept_inbound_delta(
-            NodeId(99), 1, 0, 1,
+            NodeId(99), Generation::new(1, 1), 1,
             |_| unreachable!(),
         );
 

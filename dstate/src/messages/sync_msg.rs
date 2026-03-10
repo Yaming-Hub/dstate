@@ -6,15 +6,15 @@ pub(crate) enum SyncEngineMsg {
     /// Broadcast a full snapshot to all peers.
     OutboundSnapshot {
         state_name: String,
-        version: Generation,
+        generation: Generation,
         wire_version: u32,
         data: Vec<u8>,
     },
-    /// Broadcast a delta to all peers.
+    /// Broadcast a delta to all peers. The delta advances views
+    /// from `generation.age - 1` to `generation.age`.
     OutboundDelta {
         state_name: String,
-        incarnation: u64,
-        from_age: u64,
+        generation: Generation,
         wire_version: u32,
         data: Vec<u8>,
     },
