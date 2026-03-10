@@ -470,6 +470,7 @@ pub struct ChangeNotification {
 }
 
 /// Batched wire message — one per batch interval.
+/// No target node is specified because this message is broadcast to all nodes.
 pub struct BatchedChangeFeed {
     pub source_node: NodeId,
     pub notifications: Vec<ChangeNotification>,
@@ -3426,6 +3427,7 @@ pub struct ChangeNotification {
 
 /// Batched change feed — sent at a configurable interval by the aggregator.
 /// Carries notifications for ALL state types that changed since the last flush.
+/// No target node is specified because this message is broadcast to all nodes.
 pub struct BatchedChangeFeed {
     pub source_node: NodeId,
     pub notifications: Vec<ChangeNotification>,

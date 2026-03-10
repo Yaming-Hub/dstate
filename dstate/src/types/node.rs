@@ -36,7 +36,12 @@ impl Generation {
         Self { incarnation, age }
     }
 
-    /// The initial version for a brand-new state (incarnation 0, age 0).
+    /// Sentinel value representing an uninitialized or placeholder generation.
+    ///
+    /// Used by `ShardCore::on_node_joined` as a placeholder for peers whose
+    /// real state has not yet been received. Real generations always have
+    /// `incarnation > 0` (seeded from `current_unix_time_ms()`), so any
+    /// legitimate inbound snapshot will supersede this sentinel.
     pub fn zero() -> Self {
         Self {
             incarnation: 0,
