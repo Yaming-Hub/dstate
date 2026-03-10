@@ -1379,4 +1379,157 @@ mod tests {
         assert_eq!(state.modified_time, 5_000_000);
         assert_eq!(state.value.counter, 0);
     }
+
+    // ── WIRE-05: Full snapshot updates view map ─────────────────
+
+    #[test]
+    fn wire_full_snapshot_updates_view_map() {
+        use crate::traits::state::DistributedState;
+
+        let clock = test_clock();
+        let shard = make_shard(clock);
+
+        // Simulate a peer joining.
+        let default_view = TestState { counter: 0, label: String::new() };
+        shard.on_node_joined(NodeId(2), default_view);
+
+        // Build a SyncMessage::FullSnapshot as if received over the wire,
+        // then extract its fields into an InboundSnapshot.
+        let source_node = NodeId(2);
+        let gen = Generation::new(1, 7);
+        let view = TestState { counter: 42, label: "wire-snap".into() };
+        let wire_version = TestState::WIRE_VERSION;
+
+        let result = shard.accept_inbound_snapshot(InboundSnapshot {
+            source: source_node,
+            generation: gen,
+            wire_version,
+            view: view.clone(),
+            created_time: 1_000_000,
+            modified_time: 1_007_000,
+        });
+
+        assert_eq!(result, AcceptResult::Accepted);
+        let snap = shard.snapshot();
+        let entry = snap.get(&NodeId(2)).unwrap();
+        assert_eq!(entry.generation, gen);
+        assert_eq!(entry.value.counter, 42);
+        assert_eq!(entry.value.label, "wire-snap");
+    }
+
+    // ── WIRE-06: Delta update advances peer view ────────────────
+
+    #[test]
+    fn wire_delta_advances_peer_view() {
+        let clock = test_clock();
+        let shard: ShardCore<TestDeltaStateInner, TestDeltaView> = make_delta_shard(clock);
+
+        // Join peer and accept baseline snapshot at (1, 5).
+        let default_view = TestDeltaView { counter: 0, label: String::new() };
+        shard.on_node_joined(NodeId(2), default_view);
+
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(2),
+            generation: Generation::new(1, 5),
+            wire_version: 1,
+            view: TestDeltaView { counter: 100, label: "baseline".into() },
+            created_time: 1_000_000,
+            modified_time: 1_000_000,
+        });
+
+        // Simulate receiving a DeltaUpdate: generation advances to (1, 6).
+        let result = shard.accept_inbound_delta(
+            NodeId(2),
+            Generation::new(1, 6),
+            1,
+            |v| TestDeltaView { counter: v.counter + 5, label: v.label.clone() },
+        );
+
+        assert_eq!(result, DeltaAcceptResult::Applied);
+        let snap = shard.snapshot();
+        assert_eq!(snap[&NodeId(2)].generation, Generation::new(1, 6));
+        assert_eq!(snap[&NodeId(2)].value.counter, 105);
+    }
+
+    // ── WIRE-07: Change feed marks peer stale ───────────────────
+
+    #[test]
+    fn wire_change_feed_marks_peer_stale() {
+        let clock = test_clock();
+        let shard = make_shard(clock);
+
+        // Accept a snapshot from peer at (1, 5).
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(2),
+            generation: Generation::new(1, 5),
+            wire_version: 1,
+            view: TestState { counter: 5, label: "peer".into() },
+            created_time: 1_000_000,
+            modified_time: 1_000_000,
+        });
+
+        // Simulate a BatchedChangeFeed with a ChangeNotification at (1, 10).
+        // The actor shell would call mark_stale on the shard.
+        shard.mark_stale(NodeId(2), 1, 10);
+
+        let snap = shard.snapshot();
+        let entry = snap.get(&NodeId(2)).unwrap();
+        assert_eq!(entry.pending_remote_generation, Some(Generation::new(1, 10)));
+        // The view value should still be the old snapshot (not yet updated).
+        assert_eq!(entry.value.counter, 5);
+    }
+
+    // ── WIRE-08: Request snapshot response ──────────────────────
+
+    #[test]
+    fn wire_request_snapshot_response() {
+        let clock = test_clock();
+        let mut shard = make_shard(clock);
+
+        // Mutate a few times to build up state.
+        shard.apply_mutation(|s| { s.counter = 10; s.label = "first".into(); }, |s| s.clone());
+        shard.apply_mutation(|s| { s.counter = 20; s.label = "second".into(); }, |s| s.clone());
+        shard.apply_mutation(|s| { s.counter = 30; s.label = "third".into(); }, |s| s.clone());
+
+        // Verify that state() and snapshot() provide the data a peer would
+        // need when it sends RequestSnapshot. The actual wire sending is the
+        // actor shell's responsibility — here we just verify data accessibility.
+        let state = shard.state();
+        assert_eq!(state.value.counter, 30);
+        assert_eq!(state.value.label, "third");
+        assert_eq!(state.generation.age, 3);
+        assert_eq!(state.generation.incarnation, 1);
+
+        let snap = shard.snapshot();
+        assert_eq!(snap[&NodeId(1)].value.counter, 30);
+        assert_eq!(snap[&NodeId(1)].generation.age, 3);
+    }
+
+    // ── WIRE-09: Unknown peer snapshot accepted ─────────────────
+
+    #[test]
+    fn wire_unknown_peer_snapshot_accepted() {
+        let clock = test_clock();
+        let shard = make_shard(clock);
+
+        // No prior NodeJoined for NodeId(99) — accept_inbound_snapshot
+        // should handle this via update_if which upserts.
+        let result = shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(99),
+            generation: Generation::new(3, 15),
+            wire_version: 1,
+            view: TestState { counter: 999, label: "unknown-peer".into() },
+            created_time: 2_000_000,
+            modified_time: 2_015_000,
+        });
+
+        assert_eq!(result, AcceptResult::Accepted);
+        let snap = shard.snapshot();
+        // Should have created a new entry (self + unknown peer).
+        assert_eq!(snap.len(), 2);
+        let entry = snap.get(&NodeId(99)).unwrap();
+        assert_eq!(entry.value.counter, 999);
+        assert_eq!(entry.value.label, "unknown-peer");
+        assert_eq!(entry.generation, Generation::new(3, 15));
+    }
 }
