@@ -6,7 +6,7 @@ use crate::types::node::{NodeId, Generation};
 #[derive(Debug, Clone)]
 pub struct StateObject<S> {
     /// The logical version (incarnation + age) of this state.
-    pub version: Generation,
+    pub generation: Generation,
     /// The storage format version used when this state was persisted.
     pub storage_version: u32,
     /// The state value.
@@ -18,14 +18,14 @@ pub struct StateObject<S> {
 }
 
 impl<S> StateObject<S> {
-    /// Shorthand for `self.version.age`.
+    /// Shorthand for `self.generation.age`.
     pub fn age(&self) -> u64 {
-        self.version.age
+        self.generation.age
     }
 
-    /// Shorthand for `self.version.incarnation`.
+    /// Shorthand for `self.generation.incarnation`.
     pub fn incarnation(&self) -> u64 {
-        self.version.incarnation
+        self.generation.incarnation
     }
 }
 
@@ -33,7 +33,7 @@ impl<S> StateObject<S> {
 #[derive(Debug, Clone)]
 pub struct StateViewObject<V> {
     /// The logical version (incarnation + age) of this view.
-    pub version: Generation,
+    pub generation: Generation,
     /// The wire protocol version used to serialize this view.
     pub wire_version: u32,
     /// The view value.
@@ -46,7 +46,7 @@ pub struct StateViewObject<V> {
     pub synced_at: Instant,
     /// If set, the peer has announced a newer version via a change feed
     /// notification, meaning this view is known to be stale.
-    pub pending_remote_version: Option<Generation>,
+    pub pending_remote_generation: Option<Generation>,
     /// The node that owns this view.
     pub source_node: NodeId,
 }

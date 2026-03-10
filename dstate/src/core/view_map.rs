@@ -149,7 +149,7 @@ where
     /// Return peers whose views are stale, excluding the local node.
     ///
     /// A view is stale if:
-    /// - `pending_remote_version` is set, OR
+    /// - `pending_remote_generation` is set, OR
     /// - `synced_at` is older than `max_staleness`
     pub fn stale_peers(
         &self,
@@ -164,7 +164,7 @@ where
             .filter(|(id, _)| **id != local_node)
             .filter(|(_, entry)| {
                 let vo = entry.load();
-                vo.pending_remote_version.is_some()
+                vo.pending_remote_generation.is_some()
                     || now.duration_since(vo.synced_at) > max_staleness
             })
             .map(|(id, _)| *id)

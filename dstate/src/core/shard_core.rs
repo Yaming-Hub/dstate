@@ -12,7 +12,7 @@ use crate::types::node::{NodeId, Generation};
 #[allow(dead_code)]
 pub(crate) struct InboundSnapshot<V> {
     pub source: NodeId,
-    pub version: Generation,
+    pub generation: Generation,
     pub wire_version: u32,
     pub view: V,
     pub created_time: i64,
@@ -23,7 +23,7 @@ pub(crate) struct InboundSnapshot<V> {
 /// Outcome of a successful simple mutation (State == View).
 #[derive(Debug)]
 pub(crate) struct MutationOutcome<V: Clone> {
-    pub version: Generation,
+    pub generation: Generation,
     pub view: V,
 }
 
@@ -31,7 +31,7 @@ pub(crate) struct MutationOutcome<V: Clone> {
 /// Outcome of a successful delta-aware mutation.
 #[derive(Debug)]
 pub(crate) struct DeltaMutationOutcome<V: Clone, VD: Clone> {
-    pub version: Generation,
+    pub generation: Generation,
     pub view: V,
     pub view_delta: VD,
 }
@@ -109,13 +109,13 @@ where
     ) -> Self {
         let now = clock.now();
         let initial_vo = StateViewObject {
-            version: state.version,
+            generation: state.generation,
             wire_version: state.storage_version,
             value: initial_view,
             created_time: state.created_time,
             modified_time: state.modified_time,
             synced_at: now,
-            pending_remote_version: None,
+            pending_remote_generation: None,
             source_node: node_id,
         };
         let views = ViewMap::new(node_id, initial_vo);
@@ -189,14 +189,14 @@ where
     {
         mutate_fn(&mut self.state.value);
 
-        self.state.version.age += 1;
+        self.state.generation.age += 1;
         self.state.modified_time = self.clock.unix_ms();
 
         let view = project_fn(&self.state.value);
         self.update_own_view(view.clone());
 
         MutationOutcome {
-            version: self.state.version,
+            generation: self.state.generation,
             view,
         }
     }
@@ -224,7 +224,7 @@ where
     {
         let delta_change = mutate_fn(&mut self.state.value);
 
-        self.state.version.age += 1;
+        self.state.generation.age += 1;
         self.state.modified_time = self.clock.unix_ms();
 
         let view = project_view_fn(&self.state.value);
@@ -232,7 +232,7 @@ where
         self.update_own_view(view.clone());
 
         DeltaMutationOutcome {
-            version: self.state.version,
+            generation: self.state.generation,
             view,
             view_delta,
         }
@@ -250,20 +250,20 @@ where
 
         let accepted = self.views.update_if(&source, |existing| {
             let accept = match existing {
-                Some(e) => Self::should_accept(snap.version, e.version),
+                Some(e) => Self::should_accept(snap.generation, e.generation),
                 None => true,
             };
             if !accept {
                 return None;
             }
             Some(StateViewObject {
-                version: snap.version,
+                generation: snap.generation,
                 wire_version: snap.wire_version,
                 value: snap.view,
                 created_time: snap.created_time,
                 modified_time: snap.modified_time,
                 synced_at: now,
-                pending_remote_version: None,
+                pending_remote_generation: None,
                 source_node: source,
             })
         });
@@ -302,22 +302,22 @@ where
         };
 
         // Stale incarnation — discard.
-        if incarnation < existing.version.incarnation {
+        if incarnation < existing.generation.incarnation {
             return DeltaAcceptResult::Discarded;
         }
 
         // New incarnation — gap (need full snapshot).
-        if incarnation > existing.version.incarnation {
+        if incarnation > existing.generation.incarnation {
             return DeltaAcceptResult::GapDetected {
-                expected: existing.version,
+                expected: existing.generation,
                 received_from_age: from_age,
             };
         }
 
         // Same incarnation: check age continuity.
-        if from_age != existing.version.age {
+        if from_age != existing.generation.age {
             return DeltaAcceptResult::GapDetected {
-                expected: existing.version,
+                expected: existing.generation,
                 received_from_age: from_age,
             };
         }
@@ -329,13 +329,13 @@ where
         self.views.update(
             &source,
             StateViewObject {
-                version: Generation::new(incarnation, to_age),
+                generation: Generation::new(incarnation, to_age),
                 wire_version,
                 value: new_view,
                 created_time: existing.created_time,
                 modified_time: self.clock.unix_ms(),
                 synced_at: now,
-                pending_remote_version: None,
+                pending_remote_generation: None,
                 source_node: source,
             },
         );
@@ -346,26 +346,26 @@ where
     // ── Staleness ───────────────────────────────────────────────
 
     /// Return peers whose views are stale (not synced within `max_staleness`
-    /// or have a `pending_remote_version`).
+    /// or have a `pending_remote_generation`).
     pub fn stale_peers(&self, max_staleness: Duration) -> Vec<NodeId> {
         self.views.stale_peers(self.node_id, max_staleness, self.clock.as_ref())
     }
 
     /// Mark a peer's view as stale based on a change-feed notification.
     ///
-    /// Sets `pending_remote_version` if the incoming version is newer
+    /// Sets `pending_remote_generation` if the incoming version is newer
     /// than the current entry.
     pub fn mark_stale(&self, source: NodeId, incarnation: u64, age: u64) {
         let incoming = Generation::new(incarnation, age);
         self.views.update_if(&source, |existing| {
             let existing = existing?;
 
-            if incoming <= existing.version {
+            if incoming <= existing.generation {
                 return None;
             }
 
             let mut updated = existing.clone();
-            updated.pending_remote_version = Some(incoming);
+            updated.pending_remote_generation = Some(incoming);
             Some(updated)
         });
     }
@@ -385,13 +385,13 @@ where
         self.views.insert_node(
             node_id,
             StateViewObject {
-                version: Generation::zero(),
+                generation: Generation::zero(),
                 wire_version: 0,
                 value: default_view,
                 created_time: 0,
                 modified_time: 0,
                 synced_at: now,
-                pending_remote_version: None,
+                pending_remote_generation: None,
                 source_node: node_id,
             },
         );
@@ -416,13 +416,13 @@ where
         self.views.update(
             &self.node_id,
             StateViewObject {
-                version: self.state.version,
+                generation: self.state.generation,
                 wire_version: self.state.storage_version,
                 value: view,
                 created_time: self.state.created_time,
                 modified_time: self.state.modified_time,
                 synced_at: now,
-                pending_remote_version: None,
+                pending_remote_generation: None,
                 source_node: self.node_id,
             },
         );
@@ -439,7 +439,7 @@ pub(crate) fn new_state_object<S>(
 ) -> StateObject<S> {
     let now = clock.unix_ms();
     StateObject {
-        version: Generation::new(incarnation, 0),
+        generation: Generation::new(incarnation, 0),
         storage_version: 0,
         value,
         created_time: now,
@@ -465,7 +465,7 @@ mod tests {
 
     fn make_state_object(counter: u64, label: &str, clock: &dyn Clock) -> StateObject<TestState> {
         StateObject {
-            version: Generation::new(1, 0),
+            generation: Generation::new(1, 0),
             storage_version: 1,
             value: TestState {
                 counter,
@@ -486,7 +486,7 @@ mod tests {
         clock: Arc<dyn Clock>,
     ) -> ShardCore<TestDeltaStateInner, TestDeltaView> {
         let state = StateObject {
-            version: Generation::new(1, 0),
+            generation: Generation::new(1, 0),
             storage_version: 1,
             value: TestDeltaStateInner::default(),
             created_time: clock.unix_ms(),
@@ -592,7 +592,7 @@ mod tests {
             |s| s.clone(),
         );
 
-        assert_eq!(outcome.version.age, 1);
+        assert_eq!(outcome.generation.age, 1);
         assert_eq!(shard.state().age(), 1);
         assert_eq!(shard.state().value.counter, 1);
     }
@@ -616,8 +616,8 @@ mod tests {
         let shard = make_shard(clock);
         let snap = shard.snapshot();
         let entry = snap.get(&NodeId(1)).unwrap();
-        assert_eq!(entry.version.age, 0);
-        assert_eq!(entry.version.incarnation, 1);
+        assert_eq!(entry.generation.age, 0);
+        assert_eq!(entry.generation.incarnation, 1);
         assert_eq!(entry.value.counter, 0);
         assert_eq!(entry.value.label, "init");
     }
@@ -676,7 +676,7 @@ mod tests {
 
         assert_eq!(outcome.view.counter, 42);
         assert_eq!(outcome.view.label, "updated");
-        assert_eq!(outcome.version.incarnation, 1);
+        assert_eq!(outcome.generation.incarnation, 1);
     }
 
     // ── SHARD-04: Sequential mutations produce sequential ages ──
@@ -689,7 +689,7 @@ mod tests {
         let mut ages = Vec::new();
         for i in 0..100 {
             let outcome = shard.apply_mutation(|s| s.counter = i, |s| s.clone());
-            ages.push(outcome.version.age);
+            ages.push(outcome.generation.age);
         }
 
         let expected: Vec<u64> = (1..=100).collect();
@@ -709,7 +709,7 @@ mod tests {
         let snap = shard.snapshot();
         assert_eq!(snap.len(), 2);
         assert!(snap.contains_key(&NodeId(2)));
-        assert_eq!(snap[&NodeId(2)].version.age, 0);
+        assert_eq!(snap[&NodeId(2)].generation.age, 0);
     }
 
     // ── SHARD-06: on_node_left removes entry ────────────────────
@@ -742,7 +742,7 @@ mod tests {
 
         let snap = shard.snapshot();
         let entry = snap.get(&NodeId(2)).unwrap();
-        assert_eq!(entry.pending_remote_version, Some(Generation::new(1, 10)));
+        assert_eq!(entry.pending_remote_generation, Some(Generation::new(1, 10)));
     }
 
     // ── SHARD-08: MarkStale with stale incarnation is no-op ─────
@@ -754,7 +754,7 @@ mod tests {
 
         shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(2),
-            version: Generation::new(5, 10),
+            generation: Generation::new(5, 10),
             wire_version: 1,
             view: TestState { counter: 10, label: "peer".into() },
             created_time: 1_000_000,
@@ -765,7 +765,7 @@ mod tests {
 
         let snap = shard.snapshot();
         let entry = snap.get(&NodeId(2)).unwrap();
-        assert_eq!(entry.pending_remote_version, None);
+        assert_eq!(entry.pending_remote_generation, None);
     }
 
     // ── SHARD-10: snapshot returns full view map ────────────────
@@ -817,7 +817,7 @@ mod tests {
         let snap = shard.snapshot();
         let entry = snap.get(&NodeId(1)).unwrap();
         assert_eq!(entry.value.counter, 42);
-        assert_eq!(entry.version.age, 1);
+        assert_eq!(entry.generation.age, 1);
     }
 
     // ── MUT-03: Mutation failure doesn't advance age (panic safety)
@@ -850,8 +850,8 @@ mod tests {
         );
 
         assert_eq!(outcome.view.counter, 77);
-        assert_eq!(outcome.version.age, 1);
-        assert_eq!(outcome.version.incarnation, 1);
+        assert_eq!(outcome.generation.age, 1);
+        assert_eq!(outcome.generation.incarnation, 1);
     }
 
     // ── MUT-05: Receiver replaces state on inbound snapshot ─────
@@ -866,7 +866,7 @@ mod tests {
 
         let result = shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(2),
-            version: Generation::new(1, 5),
+            generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestState { counter: 50, label: "from-peer".into() },
             created_time: 1_000_000,
@@ -877,7 +877,7 @@ mod tests {
         let snap = shard.snapshot();
         let entry = snap.get(&NodeId(2)).unwrap();
         assert_eq!(entry.value.counter, 50);
-        assert_eq!(entry.version.age, 5);
+        assert_eq!(entry.generation.age, 5);
     }
 
     // ── MUT-06: Receiver discards stale inbound snapshot ────────
@@ -889,7 +889,7 @@ mod tests {
 
         shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(2),
-            version: Generation::new(1, 10),
+            generation: Generation::new(1, 10),
             wire_version: 1,
             view: TestState { counter: 10, label: "new".into() },
             created_time: 1_000_000,
@@ -898,7 +898,7 @@ mod tests {
 
         let result = shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(2),
-            version: Generation::new(1, 5),
+            generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestState { counter: 5, label: "old".into() },
             created_time: 1_000_000,
@@ -931,7 +931,7 @@ mod tests {
             TestDeltaState::project_delta,
         );
 
-        assert_eq!(outcome.version.age, 1);
+        assert_eq!(outcome.generation.age, 1);
         assert_eq!(outcome.view.counter, 5);
         assert_eq!(outcome.view.label, "delta");
         assert_eq!(outcome.view_delta.counter_delta, 5);
@@ -1062,7 +1062,7 @@ mod tests {
             TestDeltaState::project_view,
         );
 
-        assert_eq!(outcome.version.age, 1);
+        assert_eq!(outcome.generation.age, 1);
         assert_eq!(outcome.view.counter, 7);
     }
 
@@ -1075,7 +1075,7 @@ mod tests {
 
         shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(2),
-            version: Generation::new(1, 5),
+            generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestDeltaView { counter: 10, label: "peer".into() },
             created_time: 1_000_000,
@@ -1093,7 +1093,7 @@ mod tests {
         assert_eq!(result, DeltaAcceptResult::Applied);
         let snap = shard.snapshot();
         assert_eq!(snap[&NodeId(2)].value.counter, 13);
-        assert_eq!(snap[&NodeId(2)].version.age, 6);
+        assert_eq!(snap[&NodeId(2)].generation.age, 6);
     }
 
     #[test]
@@ -1103,7 +1103,7 @@ mod tests {
 
         shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(2),
-            version: Generation::new(1, 5),
+            generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestDeltaView { counter: 10, label: "peer".into() },
             created_time: 1_000_000,
@@ -1128,7 +1128,7 @@ mod tests {
 
         shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(2),
-            version: Generation::new(2, 10),
+            generation: Generation::new(2, 10),
             wire_version: 1,
             view: TestDeltaView { counter: 10, label: "peer".into() },
             created_time: 1_000_000,
@@ -1165,7 +1165,7 @@ mod tests {
 
         shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(2),
-            version: Generation::new(1, 5),
+            generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestState { counter: 5, label: "peer".into() },
             created_time: 1_000_000,
@@ -1176,7 +1176,7 @@ mod tests {
 
         let snap = shard.snapshot();
         let entry = snap.get(&NodeId(2)).unwrap();
-        assert_eq!(entry.pending_remote_version, Some(Generation::new(2, 3)));
+        assert_eq!(entry.pending_remote_generation, Some(Generation::new(2, 3)));
     }
 
     // ── Additional: on_node_joined idempotent ───────────────────
@@ -1212,7 +1212,7 @@ mod tests {
 
         let result = shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(5),
-            version: Generation::new(1, 1),
+            generation: Generation::new(1, 1),
             wire_version: 1,
             view: TestState { counter: 1, label: "new".into() },
             created_time: 1_000_000,
@@ -1235,11 +1235,11 @@ mod tests {
         shard.on_node_joined(NodeId(2), default_view);
         shard.mark_stale(NodeId(2), 1, 10);
 
-        assert!(shard.snapshot()[&NodeId(2)].pending_remote_version.is_some());
+        assert!(shard.snapshot()[&NodeId(2)].pending_remote_generation.is_some());
 
         shard.accept_inbound_snapshot(InboundSnapshot {
             source: NodeId(2),
-            version: Generation::new(1, 10),
+            generation: Generation::new(1, 10),
             wire_version: 1,
             view: TestState { counter: 10, label: "fresh".into() },
             created_time: 1_000_000,
@@ -1247,7 +1247,7 @@ mod tests {
         });
 
         let snap = shard.snapshot();
-        assert_eq!(snap[&NodeId(2)].pending_remote_version, None);
+        assert_eq!(snap[&NodeId(2)].pending_remote_generation, None);
     }
 
     // ── Additional: new_state_object helper ─────────────────────
