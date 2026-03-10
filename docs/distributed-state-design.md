@@ -194,17 +194,24 @@ pub enum SyncUrgency {
 
 ### 2.3 Envelope Types
 
-The system wraps raw values with metadata envelopes:
+The system wraps raw values with metadata envelopes. Both envelope types
+use a [`Generation`](#51-age-based-ordering) struct to track version ordering.
 
 ```rust
+/// Logical version: (incarnation, age) with lexicographic ordering.
+/// See §5.1 for generation rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Generation {
+    pub incarnation: u64,
+    pub age: u64,
+}
+
 /// Envelope for the owning node's full state shard.
 pub struct StateObject<S> {
-    /// Monotonically increasing version; starts at 0 (meaning "no data yet").
-    pub age: u64,
-    /// Incarnation epoch — changes when the owner restarts without persisted
-    /// state (or migration fails). Ordering is `(incarnation, age)`.
-    /// See §5.1 for generation rules.
-    pub incarnation: u64,
+    /// Logical version of this state (incarnation + age).
+    /// Age is monotonically increasing; incarnation changes on restart
+    /// without persistence. Ordering is lexicographic.
+    pub generation: Generation,
     /// Storage format version — used for local persistence only.
     /// Set to `S::STORAGE_VERSION` at write time.
     pub storage_version: u32,
@@ -221,11 +228,8 @@ pub struct StateObject<S> {
 
 /// Envelope for a replicated public view on a non-owning node.
 pub struct StateViewObject<V> {
-    /// Age matching the source StateObject.age at the time of sync.
-    pub age: u64,
-    /// Incarnation of the source StateObject at the time of sync.
-    /// Used with `age` for ordering: `(incarnation, age)`.
-    pub incarnation: u64,
+    /// Generation matching the source StateObject at the time of sync.
+    pub generation: Generation,
     /// Wire format version — the version used to serialize this view
     /// when it was sent over the network. Set to `S::WIRE_VERSION` by the sender.
     pub wire_version: u32,
@@ -241,9 +245,12 @@ pub struct StateViewObject<V> {
     /// (No wall-clock `synced_time` — elapsed time from `Instant` is
     /// strictly more reliable and sufficient for diagnostics.)
     pub synced_at: Instant,
-    /// If set, a change feed notification told us newer data exists at this age.
-    /// The actual data has not been pulled yet. Cleared after a successful pull.
-    pub pending_remote_age: Option<u64>,
+    /// If set, a change feed notification told us newer data exists at this
+    /// generation. The actual data has not been pulled yet. Cleared after
+    /// a successful pull.
+    pub pending_remote_generation: Option<Generation>,
+    /// The source node that produced this view.
+    pub source_node: NodeId,
 }
 ```
 
@@ -288,81 +295,114 @@ All writes are serialized through the `StateShard` actor mailbox, so there is
 no write-write contention. The challenge is **read-write concurrency**: queries
 should not block behind ongoing mutations or sync updates.
 
-#### Design: `ArcSwap` for Lock-Free Reads
+#### Design: Two-Level `ArcSwap` for Lock-Free Reads
 
-The view map is stored in an [`ArcSwap`](https://docs.rs/arc-swap) — a
-lock-free atomic pointer swap primitive. Readers get a snapshot via an atomic
-load (no mutex, no `RwLock`); the actor is the sole writer and atomically
-swaps in a new map after each modification.
+The view map uses a **two-level [`ArcSwap`](https://docs.rs/arc-swap)**
+architecture that provides O(1) single-node updates without cloning the
+entire map:
+
+```
+Outer ArcSwap (rare swap — node join/leave only)
+│
+└─▶ HashMap<NodeId, Arc<ArcSwap<StateViewObject<V>>>>
+                          │
+                          └─▶ Inner ArcSwap (frequent swap — every mutation/sync)
+                              └─▶ StateViewObject<V>
+```
+
+- **Outer level:** `ArcSwap<HashMap<NodeId, Arc<ArcSwap<StateViewObject<V>>>>>`
+  — swapped only when nodes join or leave (rare). The clone copies `Arc`
+  pointers, not view data.
+- **Inner level:** Each node has its own `ArcSwap<StateViewObject<V>>` —
+  swapped on every mutation or inbound sync for that node. Cost is O(1):
+  a single atomic store, no map clone.
 
 ```rust
 use arc_swap::ArcSwap;
 
-struct StateShard<S: DistributedState> {
+/// Two-level concurrent view map. Outer map swapped on topology changes;
+/// inner per-node ArcSwap swapped on every state update (O(1)).
+pub(crate) struct ViewMap<V> {
+    inner: ArcSwap<HashMap<NodeId, Arc<ArcSwap<StateViewObject<V>>>>>,
+}
+
+struct ShardCore<S, V> {
     /// The owned state shard — only modified inside the actor mailbox.
-    state: StateObject<S::State>,
-
-    /// The cluster view map. Wrapped in ArcSwap for lock-free reads.
-    /// Only the actor swaps in new versions; any thread can load a snapshot.
-    view_map: Arc<ArcSwap<HashMap<NodeId, StateViewObject<S::View>>>>,
-
+    state: StateObject<S>,
+    /// Per-node lock-free view map.
+    views: ViewMap<V>,
     node_id: NodeId,
-    sync_engine: R::Ref<SyncEngineMsg<S>>,
-    config: StateConfig,
-    persistence: Option<Box<dyn StatePersistence<State = S::State>>>,
+    clock: Arc<dyn Clock>,
 }
 ```
 
-**Read path (lock-free):**
+**Read path (lock-free, 2 atomic loads):**
 
 ```rust
-// Any thread — atomic pointer load, no locking.
-let snapshot: Guard<Arc<HashMap<...>>> = self.view_map.load();
-// snapshot is a read-only reference to the map; it remains valid even
-// if the actor swaps in a new version while we're reading.
-let result = project(&*snapshot);
+// Any thread — two atomic loads, no locking.
+// 1. Load outer map (get the HashMap snapshot)
+// 2. Load inner ArcSwap for the target node
+let view = self.views.get(&peer_id);   // Option<StateViewObject<V>>
+// view is a clone; the map remains valid even if the actor
+// swaps in new values while we're reading.
 ```
 
-**Write path (actor-serialized):**
+**Write path — single node update (O(1), actor-serialized):**
 
 ```rust
 // Inside the actor's message handler — only one writer, no contention.
-let mut new_map = (**self.view_map.load()).clone();
-new_map.insert(peer_id, new_view_object);
-self.view_map.store(Arc::new(new_map));
+// Only the inner ArcSwap is swapped — the outer map is untouched.
+self.views.update(&peer_id, new_view_object);
+// Cost: 1 atomic store. No HashMap clone.
 ```
 
-The clone-and-swap has O(n) cost where n is the number of nodes. For typical
-cluster sizes (tens to low hundreds of nodes), this is negligible. The map
-entries hold `StateViewObject<V>` which contains the view by value — if `V`
-is large, the view can be wrapped in an `Arc<V>` to make cloning cheaper.
+**Write path — topology change (node join/leave, rare):**
+
+```rust
+// Clone the outer HashMap (cheap — just Arc pointer bumps), then swap.
+self.views.insert_node(new_node_id, initial_view);
+self.views.remove_node(departed_node_id);
+// Cost: O(n) Arc::clone, but this happens only on cluster membership changes.
+```
+
+**Cost comparison vs single-level ArcSwap:**
+
+| Operation | Single-level `ArcSwap<HashMap>` | Two-level `ViewMap` |
+|---|---|---|
+| Read single node | O(1) atomic + HashMap lookup | O(1) 2 atomics + HashMap lookup |
+| Update single node | O(n) deep clone of HashMap | **O(1) atomic store** |
+| Node join/leave | O(n) deep clone | O(n) Arc clone (cheap pointers) |
+| Memory overhead | 1 allocation per swap | 1 ArcSwap per node (negligible) |
+
+For a typical 100-node cluster with frequent mutations, this eliminates
+~100× overhead per update.
 
 #### Query Path: Fast Path vs Slow Path
 
 ```mermaid
 flowchart TD
     Query["query(max_staleness, project)"] --> Load["Load snapshot (lock-free)"]
-    Load --> Check{"All entries fresh?<br/>(time + no pending_remote_age)"}
+    Load --> Check{"All entries fresh?<br/>(time + no pending_remote_generation)"}
     Check -->|Yes| Fast["Invoke project(snapshot) — no actor call"]
     Check -->|No| Slow["Send RefreshAndQuery to actor mailbox"]
     Slow --> Pull["Actor: pull stale peers"]
-    Pull --> Swap["Actor: swap in updated map,<br/>clear pending_remote_age"]
+    Pull --> Swap["Actor: swap in updated views,<br/>clear pending_remote_generation"]
     Swap --> Project["Actor: invoke project(new_snapshot)"]
     Project --> Return["Return result to caller"]
     Fast --> Return
 ```
 
 - **Fast path (lock-free, no actor involvement):** Load the snapshot, check
-  all entries against `max_staleness` AND `pending_remote_age`. If everything
-  is fresh and no change feed markers are pending, invoke the projection
-  directly and return. This path involves zero message-passing and zero
-  locking — just an atomic pointer load.
+  all entries against `max_staleness` AND `pending_remote_generation`. If
+  everything is fresh and no change feed markers are pending, invoke the
+  projection directly and return. This path involves zero message-passing
+  and zero locking — just two atomic pointer loads.
 
 - **Slow path (actor-mediated):** If any entry is stale, send a
   `RefreshAndQuery` message to the `StateShard` actor. The actor pulls the
-  stale views, swaps in the updated map, and invokes the projection inside
-  its single-threaded handler. This ensures the pull-update-read sequence
-  is atomic with respect to other writes.
+  stale views, swaps in the updated entries (inner `ArcSwap` stores), and
+  invokes the projection inside its single-threaded handler. This ensures
+  the pull-update-read sequence is atomic with respect to other writes.
 
 ---
 
@@ -628,15 +668,27 @@ configured.
 
 ### 5.1 Age-Based Ordering
 
-Every mutation increments `StateObject.age`. Deltas carry `(from_age, to_age)` metadata.
+Every mutation increments the state's `age`. Both `StateObject` and
+`StateViewObject` carry a **`Generation`** struct that bundles `(incarnation, age)`
+into a single comparable unit:
 
-Each `StateObject` also carries an **`incarnation: u64`** — a monotonically
-increasing identifier that changes whenever the owner loses its state (restart
-without persistence, migration failure, etc.). The incarnation is generated from
-the current wall-clock time (`current_unix_time_ms()`) which is naturally `u64`,
-time-ordered, and unique across restarts (two restarts within the same
-millisecond is practically impossible for a crash-restart scenario).
-Ordering is by `(incarnation, age)`:
+```rust
+/// Logical version of a state, used for ordering and staleness detection.
+/// Ordered lexicographically: `(incarnation, age)`.
+///
+/// (inc=2, age=0) > (inc=1, age=999)   // new incarnation wins
+/// (inc=1, age=5) > (inc=1, age=4)     // same incarnation, newer age
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Generation {
+    pub incarnation: u64,
+    pub age: u64,
+}
+```
+
+The `incarnation` is a monotonically increasing identifier that changes
+whenever the owner loses its state (restart without persistence, migration
+failure, etc.). It is generated from `current_unix_time_ms()` which is
+naturally `u64`, time-ordered, and unique across restarts.
 
 **Incarnation generation rules at startup:**
 
@@ -652,18 +704,28 @@ Ordering is by `(incarnation, age)`:
 > monotonically increasing across process restarts (barring large NTP
 > corrections), fit naturally in `u64`, and require no external dependency.
 
-Rules for applying incoming deltas/views on a peer node:
+#### Delta Ordering
+
+Deltas carry a single `generation: Generation` field representing the state
+**after** applying the delta. The delta always advances `age` by exactly 1
+(batched deltas are not supported in the initial version).
+
+Rules for applying incoming deltas/snapshots on a peer node:
 
 | Condition | Action |
 |---|---|
-| Incoming `incarnation > local_incarnation` | **New incarnation** — accept unconditionally (owner restarted). Replace the local entry. |
-| Same incarnation, `age == local_age + 1` | Apply delta normally. |
-| Same incarnation, `age <= local_age` | **Discard** — stale or duplicate. |
-| Same incarnation, `age > local_age + 1` | **Gap detected** — request a full snapshot from the owner. |
-| Incoming `incarnation < local_incarnation` | **Discard** — from a prior lifetime. |
+| Incoming `generation.incarnation > local.incarnation` | **New incarnation** — accept snapshot unconditionally (owner restarted). For deltas: gap detected, request full snapshot. |
+| Incoming `generation.incarnation < local.incarnation` | **Discard** — from a prior lifetime. |
+| Same incarnation, `generation.age == local.age + 1` | **Apply delta** normally. |
+| Same incarnation, `generation.age <= local.age` | **Discard** — stale or duplicate. |
+| Same incarnation, `generation.age > local.age + 1` | **Gap detected** — request a full snapshot from the owner. |
+| Full snapshot with `generation > local` | **Accept** — replace the local entry. |
 
 This prevents the scenario where an owner restarts with `age=0` and peers
 reject all updates because they hold a higher age from the previous lifetime.
+The `Generation` struct's `Ord` implementation makes these comparisons concise
+and eliminates scattered `(incarnation, age)` tuple comparisons throughout
+the codebase.
 
 ### 5.2 Rolling Upgrades and Serde Versioning
 
@@ -1719,10 +1781,12 @@ enum StateShardMsg<S: DistributedState> {
     MutateWithDelta { closure: Box<dyn FnOnce(&mut S::State) -> S::StateDeltaChange + Send>, reply: ReplyChannel<Result<(), MutationError>> },
 
     /// A peer's full snapshot arrived (from SyncEngine).
-    InboundSnapshot { source: NodeId, age: u64, wire_version: u32, bytes: Vec<u8> },
+    InboundSnapshot { source: NodeId, generation: Generation, wire_version: u32, bytes: Vec<u8> },
 
     /// A peer's view delta arrived (from SyncEngine, delta-aware only).
-    InboundDelta { source: NodeId, from_age: u64, to_age: u64, wire_version: u32, bytes: Vec<u8> },
+    /// `generation` is the state AFTER applying the delta. The delta
+    /// advances age by exactly 1 (generation.age == local.age + 1).
+    InboundDelta { source: NodeId, generation: Generation, wire_version: u32, bytes: Vec<u8> },
 
     /// A new node joined the cluster.
     NodeJoined(NodeId),
@@ -1731,7 +1795,7 @@ enum StateShardMsg<S: DistributedState> {
     NodeLeft(NodeId),
 
     /// ChangeFeedAggregator reports that a peer has newer data.
-    MarkStale { source: NodeId, new_age: u64 },
+    MarkStale { source: NodeId, generation: Generation },
 
     /// Query slow path: refresh stale entries and invoke projection.
     RefreshAndQuery { max_staleness: Duration, reply: ReplyChannel<Result<Box<dyn Any>, QueryError>> },
@@ -1751,7 +1815,7 @@ enum StateShardMsg<S: DistributedState> {
 ```
 1. Apply closure to state
 2. Advance age and timestamps
-3. Clone state into view map (ArcSwap store)
+3. Clone state into view map (per-node ArcSwap store)
 4. Persist: save(state, None)  — rollback on failure
 5. Send OutboundSnapshot to SyncEngine
 6. Reply Ok to caller
@@ -1763,7 +1827,7 @@ enum StateShardMsg<S: DistributedState> {
 1. Apply closure to state, capture StateDeltaChange
 2. Advance age and timestamps
 3. project_delta(state_delta) → ViewDelta
-4. project_view(state) → View, insert into view map
+4. project_view(state) → View, insert into view map (per-node ArcSwap store)
 5. Determine sync_urgency
 6. Persist: save(state, Some(state_delta)) — rollback on failure
 7. Send OutboundDelta to SyncEngine
@@ -1774,17 +1838,18 @@ enum StateShardMsg<S: DistributedState> {
 
 ```
 1. Deserialize state/view from bytes using wire_version
-2. If incoming age ≤ local entry age → discard (stale)
-3. Insert/replace entry in view map (ArcSwap store)
+2. If incoming generation ≤ local generation → discard (stale)
+3. Insert/replace entry in view map (per-node ArcSwap store)
 ```
 
 **`InboundDelta` (delta-aware only):**
 
 ```
 1. Deserialize delta from bytes using wire_version
-2. If from_age ≠ local entry age → request full snapshot (gap)
-3. apply_delta(local_view, delta) → advance view
-4. Update entry in view map with new age
+2. If generation.incarnation ≠ local incarnation → gap or discard
+3. If generation.age ≠ local.age + 1 → gap (ahead) or discard (behind)
+4. apply_delta(local_view, delta) → new view
+5. Update entry in view map with new generation (per-node ArcSwap store)
 ```
 
 **`NodeJoined`:**
@@ -1806,14 +1871,11 @@ enum StateShardMsg<S: DistributedState> {
 
 ```
 1. Look up the source node's entry in the view map
-2. Compare (incarnation, age):
-   - If incoming incarnation > entry.incarnation → mark stale unconditionally
-     (owner restarted with new epoch)
-   - If same incarnation and new_age > entry.age → mark stale
+2. Compare incoming generation vs local generation:
+   - If incoming generation > local generation → mark stale
    - Otherwise → no-op (already have equal or newer data)
-3. Set entry.pending_remote_age = Some(new_age)
-   Set entry.pending_remote_incarnation = Some(incarnation) (if changed)
-4. ArcSwap store the updated view map
+3. Set entry.pending_remote_generation = Some(incoming_generation)
+4. Update via per-node ArcSwap store
 ```
 
 **`RefreshAndQuery` (slow path):**
@@ -1824,9 +1886,9 @@ enum StateShardMsg<S: DistributedState> {
 2. If refresh in-flight → wait for the existing refresh to complete
 3. Otherwise, identify stale entries:
    - synced_at.elapsed() > max_staleness, OR
-   - pending_remote_age > entry.age (change feed told us newer data exists)
+   - pending_remote_generation > entry.generation (change feed told us newer data exists)
 4. Pull fresh views from stale peers concurrently via SyncEngine
-5. Update view map with refreshed entries, clear pending_remote_age (ArcSwap store)
+5. Update view map with refreshed entries, clear pending_remote_generation (per-node ArcSwap store)
 6. Invoke projection on the updated snapshot
 7. Reply with projection result
 ```
@@ -3331,30 +3393,23 @@ pub enum SyncMessage {
     FullSnapshot {
         state_name: String,
         source_node: NodeId,
-        incarnation: u64,
-        age: u64,
+        generation: Generation,
         wire_version: u32,
-        view_bytes: Vec<u8>,
+        data: Vec<u8>,
     },
-    /// Incremental delta update.
+    /// Incremental delta update. The delta advances the view from
+    /// `generation.age - 1` to `generation.age` (always +1).
     DeltaUpdate {
         state_name: String,
         source_node: NodeId,
-        incarnation: u64,
-        from_age: u64,
-        to_age: u64,
+        generation: Generation,
         wire_version: u32,
-        delta_bytes: Vec<u8>,
+        data: Vec<u8>,
     },
     /// Request a full snapshot (used when a gap is detected or on join).
     RequestSnapshot {
         state_name: String,
-        requester_node: NodeId,
-        /// The minimum age the requester needs. The responder should send
-        /// a snapshot with age >= this value (typically the latest).
-        /// Prevents the requester from accepting a snapshot that is already
-        /// older than what it needs.
-        min_required_age: Option<u64>,
+        requester: NodeId,
     },
 }
 ```
@@ -3366,8 +3421,7 @@ Messages exchanged between `ChangeFeedAggregator` actors across nodes:
 pub struct ChangeNotification {
     pub state_name: String,
     pub source_node: NodeId,
-    pub incarnation: u64,
-    pub new_age: u64,
+    pub generation: Generation,
 }
 
 /// Batched change feed — sent at a configurable interval by the aggregator.

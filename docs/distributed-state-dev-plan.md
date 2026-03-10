@@ -128,20 +128,28 @@ Architecture), §11.2 (Error Types)
 
 ## PR 2 — ShardCore, StateRegistry, and Mutation Logic
 
+**Status: In review (PR #3)**
+
 **Scope:** The pure state machine logic and runtime-generic registry. After
 this PR, a single node can register state types, mutate its local shard
-via `ShardCore`, and maintain a PublicViewMap — all tested without any
+via `ShardCore`, and maintain a ViewMap — all tested without any
 actor framework.
 
 **Design ref:** §3 (Node-Local Data Layout), §6.1 (StateRegistry), §6.2
 (StateShard), §7.2 (Mutation API), §15.2 (ShardCore)
 
 **What's built:**
-- `ShardCore<S>` (`core/shard_core.rs`) — pure state machine struct (no
-  framework dependency) containing mutation logic, `should_accept()`,
-  `stale_peers()`, view map manipulation
-- Message enums (`messages/`): `StateShardMsg`, `SimpleShardMsg`,
-  `DeltaShardMsg`, `SyncEngineMsg`, `ChangeFeedMsg`
+- `ShardCore<S, V>` (`core/shard_core.rs`) — pure state machine struct
+  generic over both State and View (no framework dependency) containing
+  mutation logic, `stale_peers()`, view map manipulation
+- `ViewMap<V>` (`core/view_map.rs`) — two-level `ArcSwap` structure
+  providing O(1) per-node updates to the view map without cloning the
+  entire map on each change
+- `Generation` struct — replaces scattered `(incarnation, age)` pairs
+  throughout the codebase; deltas carry a single `generation: Generation`
+  instead of separate `from_age`/`to_age` fields
+- Message enums (`messages/`): `SimpleShardMsg`, `DeltaShardMsg`,
+  `SyncEngineMsg`, `ChangeFeedMsg`
 - `StateRegistry<R: ActorRuntime>` (`registry.rs`) — generic over the
   runtime, provides `register()`, `lookup()`,
   `broadcast_node_joined()`, `broadcast_node_left()`
@@ -152,9 +160,20 @@ actor framework.
 - `snapshot()` API for direct view map access
 - Request coalescing for `RefreshAndQuery` (thundering herd prevention)
 - Concurrency: actor mailbox for writes, ArcSwap for lock-free reads
+- Wire-level `SyncMessage` and `ChangeNotification` updated to use
+  `Generation`; `pending_remote_age` replaced by
+  `pending_remote_generation: Option<Generation>`
+
+**Key design changes from original plan:**
+- `should_accept()` removed — acceptance logic replaced by `Generation`
+  comparison (higher generation wins)
+- Delta API simplified: no `from_age`/`to_age`, each delta carries a
+  single `generation: Generation` representing the resulting state
+- `ViewMap<V>` uses a two-level `ArcSwap` for O(1) per-node updates
+  instead of a simple `ArcSwap<HashMap>`
 
 **Tests (red → green):**
-- PVM-01 through PVM-03 (PublicViewMap)
+- PVM-01 through PVM-03 (ViewMap)
 - SHARD-01 through SHARD-10 (StateShard / ShardCore)
 - MUT-01 through MUT-06 (simple mutation + full-state sync)
 - DMUT-01 through DMUT-06 (delta-aware mutation)

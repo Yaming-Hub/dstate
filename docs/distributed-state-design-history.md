@@ -1132,3 +1132,62 @@ identified 7 issues (5 design, 2 bugs). Two issues were flagged by both models.
 **Test impact:** Removed 2 tests (RT-03, RT-04 for request-reply). Added
 2 new tests (RT-15, RT-16 for subscribe/unsubscribe; ENV-08 for incarnation
 tracking). Net: 50 → 51 tests, all passing.
+
+## Iteration 35 — Generation Struct, ViewMap Optimization, and Simplified Delta API
+
+**Trigger:** Performance review of PR #3 (ShardCore, StateRegistry, mutation logic) revealed two issues:
+1. Every single-node view update cloned the entire `HashMap<NodeId, StateViewObject<V>>` — O(n) per mutation
+2. Scattered `(incarnation, age)` tuple comparisons were error-prone and verbose
+3. Delta messages carried redundant `from_age`/`to_age` fields
+
+**Changes:**
+
+#### 1. Two-Level ArcSwap ViewMap (Performance)
+
+Replaced the single-level `ArcSwap<HashMap<NodeId, StateViewObject<V>>>` with a two-level structure:
+
+```
+ArcSwap<HashMap<NodeId, Arc<ArcSwap<StateViewObject<V>>>>>
+```
+
+- **Outer level** swapped only on node join/leave (rare) — clones `Arc` pointers, not view data
+- **Inner level** (per-node `ArcSwap`) swapped on every mutation/sync — O(1) atomic store, no map clone
+- Read path: 2 atomic loads, fully lock-free
+- Encapsulated in `ViewMap<V>` struct (`core/view_map.rs`) with methods: `get`, `update`, `insert_node`, `remove_node`, `snapshot`, `stale_peers`, `update_if`
+- Eliminated ~N× overhead per update for an N-node cluster
+
+#### 2. Generation Struct (Correctness + Ergonomics)
+
+Introduced `Generation` struct in `types/node.rs` to replace all scattered `(incarnation: u64, age: u64)` pairs:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Generation {
+    pub incarnation: u64,
+    pub age: u64,
+}
+```
+
+- `Ord` implementation: lexicographic (incarnation first, then age)
+- Helper methods: `new()`, `zero()`, `is_new_incarnation()`
+- `Display` impl: `v{incarnation}:{age}` (e.g., `v1:42`)
+- Replaces fields in: `StateObject`, `StateViewObject`, all message enums (`SimpleShardMsg`, `DeltaShardMsg`, `SyncEngineMsg`, `ChangeFeedMsg`), wire-level `SyncMessage`, `ChangeNotification`
+- `pending_remote_age: Option<u64>` + `pending_remote_incarnation: Option<u64>` merged into `pending_remote_generation: Option<Generation>`
+
+#### 3. Simplified Delta API
+
+- Removed `from_age`/`to_age` from delta messages — delta always advances age by exactly 1
+- Delta carries single `generation: Generation` representing the state AFTER applying the delta
+- `accept_inbound_delta` validates: `generation.age == existing.age + 1` (same incarnation)
+- `DeltaAcceptResult::GapDetected` now carries `{ local: Generation, incoming: Generation }` for diagnostics
+- Removed `min_required_age` from `RequestSnapshot` (YAGNI)
+- Removed `ShardCore::should_accept()` — replaced by `Generation` comparison operators
+
+**Impact on design doc sections:**
+- §2.3: Envelope types now use `generation: Generation`
+- §3.1: Concurrency model updated for two-level ArcSwap
+- §5.1: Age-based ordering now documents `Generation` struct
+- §6.2: StateShard messages and workflows updated
+- §12: Wire protocol messages use `generation: Generation`
+
+**Test impact:** All 103 tests updated and passing. No new tests needed — existing coverage validates the refactored API.

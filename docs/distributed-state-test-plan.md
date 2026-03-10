@@ -59,12 +59,16 @@ dependency. Adapter-specific tests are in §16.
 
 ## 2. Node-Local Data Layout (Design §3)
 
-### 2.1 PublicViewMap — Unit Tests
+### 2.1 ViewMap — Unit Tests
+
+`ViewMap<V>` is the internal implementation (`core/view_map.rs`) that uses
+a two-level `ArcSwap` for O(1) per-node updates without cloning the entire
+map on each change.
 
 | ID | Test | Description |
 |---|---|---|
-| PVM-01 | Own node entry exists after registration | After registering a state type, the `PublicViewMap` contains an entry for the local `NodeId`. |
-| PVM-02 | Own node entry derives from local shard | Mutate the local shard, verify the local `PublicViewMap` entry reflects the projected View. |
+| PVM-01 | Own node entry exists after registration | After registering a state type, the `ViewMap<V>` contains an entry for the local `NodeId`. |
+| PVM-02 | Own node entry derives from local shard | Mutate the local shard, verify the local `ViewMap<V>` entry reflects the projected View at the current `Generation`. |
 | PVM-03 | Map is empty of peers on single-node cluster | On a single node, only the local entry exists. |
 
 ---
@@ -145,20 +149,20 @@ dependency. Adapter-specific tests are in §16.
 
 | ID | Test | Description |
 |---|---|---|
-| VER-01 | Delta at `local_age + 1` applied normally | Local view at age 5, receive delta from_age=5 to_age=6. Verify delta is applied and local age advances to 6. |
-| VER-02 | Stale delta discarded | Local view at age 5, receive delta from_age=3 to_age=4. Verify delta is discarded and local age remains 5. |
-| VER-03 | Duplicate delta discarded | Local view at age 5, receive delta from_age=4 to_age=5. Verify delta is discarded. |
-| VER-04 | Gap triggers full snapshot request | Local view at age 5, receive delta from_age=6 to_age=7. Verify a `RequestSnapshot` is sent and the delta is not applied. |
+| VER-01 | Delta at `local_age + 1` applied normally | Local view at age 5, receive delta with generation (inc=1, age=6). Verify delta is applied and local age advances to 6. |
+| VER-02 | Stale delta discarded | Local view at age 5, receive delta with generation (inc=1, age=4). Verify delta is discarded and local age remains 5. |
+| VER-03 | Duplicate delta discarded | Local view at age 5, receive delta with generation (inc=1, age=5). Verify delta is discarded. |
+| VER-04 | Gap triggers full snapshot request | Local view at age 5, receive delta with generation (inc=1, age=8). Verify a `RequestSnapshot` is sent and the delta is not applied. |
 | VER-05 | Full snapshot at higher age replaces local view | Local view at age 5, receive full snapshot at age 10. Verify local view is replaced and age is now 10. |
-| INC-01 | Higher incarnation accepted unconditionally | Peer cached at `(incarnation=100, age=50)`. Receive snapshot at `(incarnation=200, age=0)`. Verify entry replaced — new incarnation wins even though age is lower. |
-| INC-02 | Lower incarnation rejected | Peer cached at `(incarnation=200, age=5)`. Receive snapshot at `(incarnation=100, age=99)`. Verify discarded — old lifetime. |
-| INC-03 | Same incarnation follows normal age rules | Peer at `(incarnation=100, age=5)`. Receive snapshot at `(incarnation=100, age=3)`. Verify discarded. |
-| INC-04 | Incarnation generated on startup without persistence | Start `StateShard` with `persistence: None`. Verify `incarnation` is set to `current_unix_time_ms()` (via TestClock). |
-| INC-05 | Incarnation preserved on startup with persistence | Persist state with `incarnation=42`. Restart actor. Verify loaded state has `incarnation=42`. |
-| INC-06 | Incarnation changes on migration failure | Persist at `STORAGE_VERSION=1`, upgrade to V2, `migrate_state` returns `Err`. Verify actor starts with a new incarnation (not the persisted one). |
-| INC-07 | Incarnation propagated in FullSnapshot wire message | Mutate and broadcast. Verify the `SyncMessage::FullSnapshot` carries the correct `incarnation`. |
-| INC-08 | Incarnation propagated in DeltaUpdate wire message | Same as INC-07 for `SyncMessage::DeltaUpdate`. |
-| INC-09 | Incarnation propagated in ChangeNotification | Mutate, verify the `ChangeNotification` sent to the ChangeFeedAggregator carries the correct `incarnation`. |
+| INC-01 | Higher incarnation accepted unconditionally | Peer cached at `Generation::new(100, 50)`. Receive snapshot at `Generation::new(200, 0)`. Verify entry replaced — new incarnation wins even though age is lower. |
+| INC-02 | Lower incarnation rejected | Peer cached at `Generation::new(200, 5)`. Receive snapshot at `Generation::new(100, 99)`. Verify discarded — old lifetime. |
+| INC-03 | Same incarnation follows normal age rules | Peer at `Generation::new(100, 5)`. Receive snapshot at `Generation::new(100, 3)`. Verify discarded. |
+| INC-04 | Incarnation generated on startup without persistence | Start `StateShard` with `persistence: None`. Verify `Generation` incarnation is set to `current_unix_time_ms()` (via TestClock). |
+| INC-05 | Incarnation preserved on startup with persistence | Persist state with `Generation::new(42, 0)`. Restart actor. Verify loaded state has matching `Generation`. |
+| INC-06 | Incarnation changes on migration failure | Persist at `STORAGE_VERSION=1`, upgrade to V2, `migrate_state` returns `Err`. Verify actor starts with a new `Generation` incarnation (not the persisted one). |
+| INC-07 | Generation propagated in FullSnapshot wire message | Mutate and broadcast. Verify the `SyncMessage::FullSnapshot` carries the correct `Generation`. |
+| INC-08 | Generation propagated in DeltaUpdate wire message | Same as INC-07 for `SyncMessage::DeltaUpdate`. |
+| INC-09 | Generation propagated in ChangeNotification | Mutate, verify the `ChangeNotification` sent to the ChangeFeedAggregator carries the correct `Generation`. |
 
 ### 4.2 Wire Version Compatibility — Integration Tests
 
@@ -231,7 +235,7 @@ and kameo are in §16.
 
 ### 5.2 StateShard / ShardCore — Unit Tests
 
-Tests in this section exercise `ShardCore<S>` directly (pure state machine,
+Tests in this section exercise `ShardCore<S, V>` directly (pure state machine,
 no framework dependency) and the actor shell message routing via
 `TestRuntime`.
 
@@ -239,12 +243,12 @@ no framework dependency) and the actor shell message routing via
 |---|---|---|
 | SHARD-01 | Mutation increments age | Mutate once, verify age goes from 0 to 1. Mutate again, verify age is 2. |
 | SHARD-02 | Mutation updates `modified_time` | Mutate, verify `modified_time` is updated via the injected Clock. |
-| SHARD-03 | Mutation generates delta and forwards to SyncEngine | Mutate, verify the `SyncEngine` receives a delta message with correct `from_age` and `to_age`. |
+| SHARD-03 | Mutation generates delta and forwards to SyncEngine | Mutate, verify the `SyncEngine` receives a delta message with correct `generation`. |
 | SHARD-04 | Concurrent mutation requests are serialized | Send 100 mutation messages concurrently. Verify ages are sequential 1..100 with no gaps or duplicates. |
 | SHARD-05 | `on_node_joined` adds entry to PublicViewMap | Send `NodeJoined(node_x)`, verify `PublicViewMap` contains an entry for `node_x`. |
 | SHARD-06 | `on_node_left` removes entry from PublicViewMap | Send `NodeLeft(node_x)`, verify `PublicViewMap` no longer contains `node_x`. |
-| SHARD-07 | `MarkStale` sets `pending_remote_age` on peer entry | Send `MarkStale { source, incarnation, age }`. Verify the peer's `pending_remote_age` is set. |
-| SHARD-08 | `MarkStale` with stale incarnation is no-op | Peer at `(incarnation=200, age=5)`. Send MarkStale `(incarnation=100, age=99)`. Verify entry unchanged. |
+| SHARD-07 | `MarkStale` sets `pending_remote_generation` on peer entry | Send `MarkStale { source, generation }`. Verify the peer's `pending_remote_generation` is set. |
+| SHARD-08 | `MarkStale` with stale generation is no-op | Peer at `Generation::new(200, 5)`. Send MarkStale with `Generation::new(100, 99)`. Verify entry unchanged. |
 | SHARD-09 | Request coalescing: concurrent queries share pull | Send 3 `RefreshAndQuery` messages while one pull is in-flight. Verify only 1 pull request is sent (not 3). |
 | SHARD-10 | `snapshot()` returns view map without freshness check | Call `snapshot()`. Verify the full view map is returned even if entries are stale. |
 
