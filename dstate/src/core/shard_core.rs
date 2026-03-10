@@ -61,6 +61,29 @@ pub(crate) enum DeltaAcceptResult {
     UnknownPeer,
 }
 
+/// Result of a freshness-checked query against the view map.
+///
+/// # Threading model
+///
+/// This enum is returned by [`ShardCore::query_local`]. It is intended for
+/// single-actor use — the actor shell inspects the result and either returns
+/// the projection directly (fast path) or initiates pulls for stale peers
+/// before re-querying (slow path).
+#[derive(Debug)]
+pub(crate) enum QueryResult<R> {
+    /// All views are fresh. The projection result is ready.
+    Fresh(R),
+    /// Some peers have stale views. The projection ran on the current
+    /// (potentially stale) data, but the caller should pull fresh data
+    /// from the listed peers and re-query if freshness is required.
+    StalePeersDetected {
+        stale_peers: Vec<NodeId>,
+        /// The projection result computed on the current (stale) snapshot.
+        /// The actor shell may discard this and re-project after pulling.
+        result: R,
+    },
+}
+
 /// Pure state machine managing one distributed state shard on a single node.
 ///
 /// `ShardCore` holds the owned `StateObject<S>` and the cluster-wide
@@ -425,6 +448,32 @@ where
     }
 
     // ── Helpers ─────────────────────────────────────────────────
+
+    /// Query the view map with a freshness requirement.
+    ///
+    /// Checks every peer's view for staleness (by elapsed time since
+    /// `synced_at` or by `pending_remote_generation`). If all views are
+    /// fresh, runs the projection and returns [`QueryResult::Fresh`].
+    /// Otherwise, returns [`QueryResult::StalePeersDetected`] with the
+    /// list of stale peers so the actor shell can pull and re-query.
+    ///
+    /// The local node's own entry is never considered stale.
+    pub fn query_local<R, F>(&self, max_staleness: Duration, project: F) -> QueryResult<R>
+    where
+        F: FnOnce(&HashMap<NodeId, StateViewObject<V>>) -> R,
+    {
+        let snapshot = self.views.snapshot();
+        let stale = self.views.stale_peers(self.node_id, max_staleness, &*self.clock);
+        let result = project(&snapshot);
+        if stale.is_empty() {
+            QueryResult::Fresh(result)
+        } else {
+            QueryResult::StalePeersDetected {
+                stale_peers: stale,
+                result,
+            }
+        }
+    }
 
     /// Update the local node's own entry in the view map. O(1) — just
     /// an atomic swap on the per-node ArcSwap, no map cloning.
@@ -1531,5 +1580,409 @@ mod tests {
         assert_eq!(entry.value.counter, 999);
         assert_eq!(entry.value.label, "unknown-peer");
         assert_eq!(entry.generation, Generation::new(3, 15));
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PR 4 — Query Logic Tests
+    // ══════════════════════════════════════════════════════════════
+
+    /// Helper: add a peer with a fresh snapshot at a given generation.
+    fn add_fresh_peer(shard: &ShardCore<TestState, TestState>, node_id: NodeId, counter: u64, clock: &dyn Clock) {
+        let default_view = TestState { counter: 0, label: String::new() };
+        shard.on_node_joined(node_id, default_view);
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: node_id,
+            generation: Generation::new(1, 1),
+            wire_version: 1,
+            view: TestState { counter, label: format!("peer-{}", node_id.0) },
+            created_time: clock.unix_ms(),
+            modified_time: clock.unix_ms(),
+        });
+    }
+
+    // ── QUERY-01: Projection callback receives full view map ────
+
+    #[test]
+    fn query_01_projection_receives_full_view_map() {
+        let clock = test_clock();
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId(3), 20, clock.as_ref());
+        add_fresh_peer(&shard, NodeId(4), 30, clock.as_ref());
+
+        let result = shard.query_local(Duration::from_secs(5), |snap| {
+            snap.len()
+        });
+
+        match result {
+            QueryResult::Fresh(count) => assert_eq!(count, 4), // self + 3 peers
+            QueryResult::StalePeersDetected { .. } => panic!("expected fresh"),
+        }
+    }
+
+    // ── QUERY-02: Stale entries detected by time ────────────────
+
+    #[test]
+    fn query_02_stale_entries_detected_by_time() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+
+        // Advance time beyond max_staleness.
+        tc.advance(Duration::from_secs(10));
+
+        let result = shard.query_local(Duration::from_secs(5), |snap| {
+            snap.len()
+        });
+
+        match result {
+            QueryResult::StalePeersDetected { stale_peers, result } => {
+                assert_eq!(stale_peers, vec![NodeId(2)]);
+                assert_eq!(result, 2);
+            }
+            QueryResult::Fresh(_) => panic!("expected stale detection"),
+        }
+    }
+
+    // ── QUERY-03: Fresh entries not re-fetched ──────────────────
+
+    #[test]
+    fn query_03_fresh_entries_not_flagged() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId(3), 20, clock.as_ref());
+
+        // Advance time but stay within max_staleness.
+        tc.advance(Duration::from_secs(2));
+
+        let result = shard.query_local(Duration::from_secs(5), |snap| {
+            snap.len()
+        });
+
+        match result {
+            QueryResult::Fresh(count) => assert_eq!(count, 3),
+            QueryResult::StalePeersDetected { .. } => panic!("expected fresh"),
+        }
+    }
+
+    // ── QUERY-04: Callback result is returned to caller ─────────
+
+    #[test]
+    fn query_04_callback_result_returned() {
+        let clock = test_clock();
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 42, clock.as_ref());
+
+        let result = shard.query_local(Duration::from_secs(5), |snap| {
+            snap.values()
+                .map(|v| v.value.counter)
+                .sum::<u64>()
+        });
+
+        match result {
+            QueryResult::Fresh(sum) => assert_eq!(sum, 42), // self=0 + peer=42
+            QueryResult::StalePeersDetected { .. } => panic!("expected fresh"),
+        }
+    }
+
+    // ── QUERY-05: Stale peer produces StalePeersDetected ────────
+
+    #[test]
+    fn query_05_unreachable_peer_returns_stale() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId(3), 20, clock.as_ref());
+
+        // Only peer 2 goes stale.
+        tc.advance(Duration::from_secs(6));
+        // Re-sync peer 3 so it's fresh.
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(3),
+            generation: Generation::new(1, 2),
+            wire_version: 1,
+            view: TestState { counter: 25, label: "refreshed".into() },
+            created_time: clock.unix_ms(),
+            modified_time: clock.unix_ms(),
+        });
+
+        let result = shard.query_local(Duration::from_secs(5), |snap| {
+            snap[&NodeId(3)].value.counter
+        });
+
+        match result {
+            QueryResult::StalePeersDetected { stale_peers, result } => {
+                assert_eq!(stale_peers, vec![NodeId(2)]);
+                assert_eq!(result, 25);
+            }
+            QueryResult::Fresh(_) => panic!("expected stale detection for peer 2"),
+        }
+    }
+
+    // ── QUERY-06: pending_remote_generation triggers stale detection
+
+    #[test]
+    fn query_06_pending_remote_generation_triggers_stale() {
+        let clock = test_clock();
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+
+        // Simulate change feed notification: peer 2 is now at generation (1, 5).
+        shard.mark_stale(NodeId(2), 1, 5);
+
+        let result = shard.query_local(Duration::from_secs(60), |snap| {
+            snap[&NodeId(2)].value.counter
+        });
+
+        match result {
+            QueryResult::StalePeersDetected { stale_peers, result } => {
+                assert_eq!(stale_peers, vec![NodeId(2)]);
+                assert_eq!(result, 10); // old value still visible
+            }
+            QueryResult::Fresh(_) => panic!("expected stale detection via pending_remote_generation"),
+        }
+    }
+
+    // ── QUERY-07: Multiple stale peers detected concurrently ────
+
+    #[test]
+    fn query_07_multiple_stale_peers() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId(3), 20, clock.as_ref());
+        add_fresh_peer(&shard, NodeId(4), 30, clock.as_ref());
+
+        // All peers go stale.
+        tc.advance(Duration::from_secs(10));
+
+        let result = shard.query_local(Duration::from_secs(5), |snap| {
+            snap.len()
+        });
+
+        match result {
+            QueryResult::StalePeersDetected { mut stale_peers, result } => {
+                stale_peers.sort();
+                assert_eq!(stale_peers, vec![NodeId(2), NodeId(3), NodeId(4)]);
+                assert_eq!(result, 4);
+            }
+            QueryResult::Fresh(_) => panic!("expected 3 stale peers"),
+        }
+    }
+
+    // ── QUERY-08: snapshot() returns stale data without pulling ──
+
+    #[test]
+    fn query_08_snapshot_returns_stale_data_without_freshness() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 42, clock.as_ref());
+
+        // Make it very stale.
+        tc.advance(Duration::from_secs(3600));
+
+        // snapshot() does not check freshness — returns whatever is there.
+        let snap = shard.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[&NodeId(2)].value.counter, 42);
+    }
+
+    // ── QUERY: local node is never considered stale ─────────────
+
+    #[test]
+    fn query_local_node_never_stale() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+        let shard = make_shard(clock.clone());
+
+        // Advance time so even the local node's synced_at is old.
+        tc.advance(Duration::from_secs(100));
+
+        // With no peers, query should always be fresh (local node excluded).
+        let result = shard.query_local(Duration::from_secs(5), |snap| {
+            snap.len()
+        });
+
+        match result {
+            QueryResult::Fresh(count) => assert_eq!(count, 1),
+            QueryResult::StalePeersDetected { .. } => panic!("local node should not be stale"),
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PR 4 — Dynamic Sync Urgency Integration Tests
+    // ══════════════════════════════════════════════════════════════
+
+    // These tests verify the integration between SyncLogic.resolve_action()
+    // and ShardCore mutation outcomes. The actual dispatch (push/timer/suppress)
+    // is actor-shell behavior, but we test the decision logic here.
+
+    use crate::core::sync_logic::{SyncAction, SyncLogic};
+    use crate::types::config::SyncStrategy;
+    use crate::traits::state::SyncUrgency;
+
+    // ── SYNC-14: Immediate bypasses timer ───────────────────────
+
+    #[test]
+    fn sync_14_immediate_bypasses_timer() {
+        let logic = SyncLogic::new("counters".into(), SyncStrategy::active_push(), true);
+        let action = logic.resolve_action(SyncUrgency::Immediate);
+        assert_eq!(action, SyncAction::BroadcastDelta);
+    }
+
+    // ── SYNC-15: Delayed overrides interval ─────────────────────
+
+    #[test]
+    fn sync_15_delayed_overrides_interval() {
+        let logic = SyncLogic::new("counters".into(), SyncStrategy::active_push(), true);
+        let delay = Duration::from_secs(1);
+        let action = logic.resolve_action(SyncUrgency::Delayed(delay));
+        assert_eq!(action, SyncAction::ScheduleDelayed(Duration::from_secs(1)));
+    }
+
+    // ── SYNC-16: Suppress skips broadcast ───────────────────────
+
+    #[test]
+    fn sync_16_suppress_skips_broadcast() {
+        let logic = SyncLogic::new("counters".into(), SyncStrategy::active_push(), true);
+        let action = logic.resolve_action(SyncUrgency::Suppress);
+        assert_eq!(action, SyncAction::Suppress);
+    }
+
+    // ── SYNC-17: Suppressed deltas accumulate ───────────────────
+
+    #[test]
+    fn sync_17_suppressed_deltas_accumulate() {
+        use crate::core::delta_accumulator::DeltaAccumulator;
+
+        let logic = SyncLogic::new("counters".into(), SyncStrategy::active_push(), true);
+        let mut acc = DeltaAccumulator::new();
+
+        // 3 suppressed mutations → accumulate.
+        for i in 0..3 {
+            let action = logic.resolve_action(SyncUrgency::Suppress);
+            assert_eq!(action, SyncAction::Suppress);
+            acc.accumulate(format!("delta-{i}"));
+        }
+
+        // Non-suppressed mutation → flush accumulated + broadcast current.
+        let action = logic.resolve_action(SyncUrgency::Immediate);
+        assert_eq!(action, SyncAction::BroadcastDelta);
+
+        let flushed = acc.flush().unwrap();
+        assert_eq!(flushed.len(), 3);
+        assert_eq!(flushed[0], "delta-0");
+        assert_eq!(flushed[2], "delta-2");
+        // After flush, buffer is empty.
+        assert!(acc.is_empty());
+    }
+
+    // ── SYNC-18: Default uses configured strategy ───────────────
+
+    #[test]
+    fn sync_18_default_uses_configured_strategy() {
+        // ActivePush → BroadcastDelta for Default urgency.
+        let push_logic = SyncLogic::new("counters".into(), SyncStrategy::active_push(), true);
+        assert_eq!(
+            push_logic.resolve_action(SyncUrgency::Default),
+            SyncAction::BroadcastDelta,
+        );
+
+        // ActiveFeedLazyPull → NotifyChangeFeed for Default urgency.
+        let feed_logic = SyncLogic::new("sessions".into(), SyncStrategy::feed_lazy_pull(), true);
+        assert_eq!(
+            feed_logic.resolve_action(SyncUrgency::Default),
+            SyncAction::NotifyChangeFeed,
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PR 4 — Error Handling Tests
+    // ══════════════════════════════════════════════════════════════
+
+    // ── ERR-05: Stale-state retry succeeds on second attempt ────
+
+    #[test]
+    fn err_05_stale_retry_succeeds_after_refresh() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+
+        // First query: peer is stale.
+        tc.advance(Duration::from_secs(10));
+
+        let result = shard.query_local(Duration::from_secs(5), |snap| {
+            snap[&NodeId(2)].value.counter
+        });
+        assert!(matches!(result, QueryResult::StalePeersDetected { .. }));
+
+        // Simulate the actor shell pulling fresh data.
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(2),
+            generation: Generation::new(1, 5),
+            wire_version: 1,
+            view: TestState { counter: 99, label: "refreshed".into() },
+            created_time: clock.unix_ms(),
+            modified_time: clock.unix_ms(),
+        });
+
+        // Second query: all fresh now.
+        let result = shard.query_local(Duration::from_secs(5), |snap| {
+            snap[&NodeId(2)].value.counter
+        });
+        match result {
+            QueryResult::Fresh(counter) => assert_eq!(counter, 99),
+            QueryResult::StalePeersDetected { .. } => panic!("expected fresh after refresh"),
+        }
+    }
+
+    // ── ERR-06: Backoff between retries ─────────────────────────
+    // At the pure-logic level, we verify that stale_peers() consistently
+    // returns the same stale peers until they are refreshed, supporting
+    // a retry loop with backoff at the actor shell level.
+
+    #[test]
+    fn err_06_stale_peers_consistent_for_retry() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+        let shard = make_shard(clock.clone());
+
+        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+        tc.advance(Duration::from_secs(10));
+
+        // Multiple calls consistently report the same stale peer.
+        let stale1 = shard.stale_peers(Duration::from_secs(5));
+        let stale2 = shard.stale_peers(Duration::from_secs(5));
+        assert_eq!(stale1, stale2);
+        assert_eq!(stale1, vec![NodeId(2)]);
+
+        // After refresh, peer is no longer stale.
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(2),
+            generation: Generation::new(1, 5),
+            wire_version: 1,
+            view: TestState { counter: 99, label: "refreshed".into() },
+            created_time: clock.unix_ms(),
+            modified_time: clock.unix_ms(),
+        });
+
+        let stale3 = shard.stale_peers(Duration::from_secs(5));
+        assert!(stale3.is_empty());
     }
 }
