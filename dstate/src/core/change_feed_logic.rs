@@ -7,9 +7,9 @@ use crate::types::sync_message::{BatchedChangeFeed, ChangeNotification};
 ///
 /// # Threading model
 ///
-/// This struct is **not `Send`/`Sync`** by design. It is owned exclusively by
-/// a single actor (`ChangeFeedAggregator`) and accessed sequentially within
-/// that actor's message loop — no internal locking is needed.
+/// This struct is intended for single-actor use. It is owned exclusively by
+/// the `ChangeFeedAggregator` actor and accessed sequentially within that
+/// actor's message loop — no internal locking is needed.
 ///
 /// # Ownership and Data Flow
 ///
