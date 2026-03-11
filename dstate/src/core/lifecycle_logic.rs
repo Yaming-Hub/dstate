@@ -60,6 +60,15 @@ pub(crate) enum LeaveAction {
 /// ```
 #[allow(dead_code)]
 pub(crate) struct LifecycleLogic {
+    /// Nodes that have been removed via `on_node_left` and have not yet
+    /// re-joined via `on_node_joined`.
+    ///
+    /// After `on_node_left` removes a peer from the view map, late
+    /// in-flight snapshots from that peer could re-create its view map
+    /// entry (because `accept_inbound_snapshot` accepts when no existing
+    /// entry is found). This set lets `should_accept_from` reject those
+    /// stale messages. The entry is cleared when the peer re-joins
+    /// (i.e., `on_node_joined` is called again).
     departed_nodes: HashSet<NodeId>,
 }
 
