@@ -40,7 +40,12 @@ pub(crate) struct DeltaMutationOutcome<V: Clone, VD: Clone> {
 /// A mutation that has been applied to a clone of the state but not yet
 /// committed. The caller should persist `state()` and then call
 /// `ShardCore::commit_mutation` on success.
+///
+/// Contains the `base_generation` from which this mutation was derived.
+/// `commit_mutation` verifies this matches the current state to prevent
+/// out-of-order or duplicate commits.
 pub(crate) struct PreparedMutation<S: Clone, V: Clone> {
+    pub(crate) base_generation: Generation,
     pub(crate) new_state: StateObject<S>,
     pub(crate) view: V,
 }
@@ -56,6 +61,7 @@ impl<S: Clone, V: Clone> PreparedMutation<S, V> {
 #[allow(dead_code)] // Used by tests and future actor shell
 /// A delta mutation that has been applied to a clone but not yet committed.
 pub(crate) struct PreparedDeltaMutation<S: Clone, V: Clone, VD: Clone> {
+    pub(crate) base_generation: Generation,
     pub(crate) new_state: StateObject<S>,
     pub(crate) view: V,
     pub(crate) view_delta: VD,
@@ -311,6 +317,7 @@ where
         F: FnOnce(&mut S),
         P: FnOnce(&S) -> V,
     {
+        let base_generation = self.state.generation;
         let mut new_state = self.state.clone();
         mutate_fn(&mut new_state.value);
         new_state.generation.age += 1;
@@ -318,17 +325,30 @@ where
 
         let view = project_fn(&new_state.value);
 
-        PreparedMutation { new_state, view }
+        PreparedMutation { base_generation, new_state, view }
     }
 
     /// Phase 2: Commit a previously prepared mutation.
     ///
     /// Replaces the owned state and updates the local view map entry.
     /// Only call after persistence succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the prepared mutation was derived from a different base
+    /// state than the current one (i.e., another mutation was committed
+    /// in between). This enforces one-at-a-time commit ordering.
     pub fn commit_mutation(
         &mut self,
         prepared: PreparedMutation<S, V>,
     ) -> MutationOutcome<V> {
+        assert_eq!(
+            prepared.base_generation, self.state.generation,
+            "commit_mutation: prepared mutation was derived from generation {:?}, \
+             but current state is at {:?} — another mutation was committed in between",
+            prepared.base_generation, self.state.generation,
+        );
+
         self.state = prepared.new_state;
         self.update_own_view(prepared.view.clone());
 
@@ -352,6 +372,7 @@ where
         PD: FnOnce(&DC) -> VD,
         VD: Clone + Debug,
     {
+        let base_generation = self.state.generation;
         let mut new_state = self.state.clone();
         let delta_change = mutate_fn(&mut new_state.value);
         new_state.generation.age += 1;
@@ -361,6 +382,7 @@ where
         let view_delta = project_delta_fn(&delta_change);
 
         PreparedDeltaMutation {
+            base_generation,
             new_state,
             view,
             view_delta,
@@ -368,10 +390,20 @@ where
     }
 
     /// Phase 2 (delta-aware): Commit a previously prepared delta mutation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the prepared mutation was derived from a different base
+    /// state than the current one.
     pub fn commit_delta_mutation<VD: Clone + Debug>(
         &mut self,
         prepared: PreparedDeltaMutation<S, V, VD>,
     ) -> DeltaMutationOutcome<V, VD> {
+        assert_eq!(
+            prepared.base_generation, self.state.generation,
+            "commit_delta_mutation: base generation mismatch",
+        );
+
         self.state = prepared.new_state;
         self.update_own_view(prepared.view.clone());
 
@@ -2378,5 +2410,51 @@ mod tests {
         // State unchanged — still at age 1 with counter=1
         assert_eq!(shard.state().generation.age, 1);
         assert_eq!(shard.state().value.counter, 1);
+    }
+
+    // ── Stale commit detection ───────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "another mutation was committed in between")]
+    fn stale_commit_panics() {
+        let clock = test_clock();
+        let mut shard = make_shard(clock);
+
+        // Prepare two mutations from the same base state
+        let p1 = shard.prepare_mutation(|s| s.counter = 1, |s| s.clone());
+        let p2 = shard.prepare_mutation(|s| s.counter = 2, |s| s.clone());
+
+        // Commit p1 — advances state to age 1
+        shard.commit_mutation(p1);
+
+        // Commit p2 — derived from age 0, but state is now age 1 → panic
+        shard.commit_mutation(p2);
+    }
+
+    #[test]
+    #[should_panic(expected = "base generation mismatch")]
+    fn stale_delta_commit_panics() {
+        let clock = test_clock();
+        let mut shard = make_delta_shard(clock);
+
+        let p1 = shard.prepare_mutation_with_delta(
+            |s| {
+                s.counter += 1;
+                TestDeltaChange { counter_delta: 1, new_label: None, accumulator_delta: 0.0 }
+            },
+            |s| TestDeltaState::project_view(s),
+            |dc| TestDeltaState::project_delta(dc),
+        );
+        let p2 = shard.prepare_mutation_with_delta(
+            |s| {
+                s.counter += 10;
+                TestDeltaChange { counter_delta: 10, new_label: None, accumulator_delta: 0.0 }
+            },
+            |s| TestDeltaState::project_view(s),
+            |dc| TestDeltaState::project_delta(dc),
+        );
+
+        shard.commit_delta_mutation(p1);
+        shard.commit_delta_mutation(p2); // panics
     }
 }

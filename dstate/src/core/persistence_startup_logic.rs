@@ -139,7 +139,14 @@ impl PersistenceStartupLogic {
                             StartupOutcome::Migrated { state, from_version }
                         }
                         Err(reason) => {
-                            let state = self.fresh_state(default_value, clock);
+                            // Guarantee monotonic incarnation: use the
+                            // greater of clock time and loaded incarnation + 1
+                            // to prevent peers from rejecting the new state.
+                            let state = self.fresh_state_at_least(
+                                default_value,
+                                clock,
+                                loaded.generation.incarnation,
+                            );
                             StartupOutcome::FallbackToEmpty { state, reason }
                         }
                     }
@@ -152,6 +159,26 @@ impl PersistenceStartupLogic {
         let now = clock.unix_ms();
         StateObject {
             generation: Generation::new(now as u64, 0),
+            storage_version: self.current_storage_version,
+            value,
+            created_time: now,
+            modified_time: now,
+        }
+    }
+
+    /// Like `fresh_state` but guarantees the incarnation is strictly
+    /// greater than `old_incarnation` (prevents peers from rejecting
+    /// the new state on fast restarts or clock skew).
+    fn fresh_state_at_least<S>(
+        &self,
+        value: S,
+        clock: &dyn Clock,
+        old_incarnation: u64,
+    ) -> StateObject<S> {
+        let now = clock.unix_ms();
+        let incarnation = std::cmp::max(now as u64, old_incarnation + 1);
+        StateObject {
+            generation: Generation::new(incarnation, 0),
             storage_version: self.current_storage_version,
             value,
             created_time: now,
@@ -251,11 +278,47 @@ mod tests {
 
         match &outcome {
             StartupOutcome::FallbackToEmpty { state, reason } => {
-                // New incarnation from clock, not the old 42
-                assert_eq!(state.generation.incarnation, 1_700_000_000_000);
+                // New incarnation must be > old incarnation (42)
+                assert!(state.generation.incarnation > 42);
                 assert_eq!(state.generation.age, 0);
                 assert_eq!(state.value, "default");
                 assert!(reason.contains("migration not supported"));
+            }
+            _ => panic!("expected FallbackToEmpty"),
+        }
+    }
+
+    // ── INC-06b: Monotonic incarnation when clock < old incarnation ───
+
+    #[test]
+    fn inc_06b_migration_failure_incarnation_monotonic() {
+        // Clock time (100) is less than loaded incarnation (9999).
+        // Incarnation must still be > 9999.
+        let clock = TestClock::with_base_unix_ms(100);
+        let logic = PersistenceStartupLogic::new(2);
+
+        let loaded = StateObject {
+            generation: Generation::new(9999, 5),
+            storage_version: 1,
+            value: "old".to_string(),
+            created_time: 50,
+            modified_time: 60,
+        };
+
+        let outcome = logic.initialize(
+            Ok(Some(loaded)),
+            "default".into(),
+            &clock,
+            |_, _| Err("fail".into()),
+        );
+
+        match &outcome {
+            StartupOutcome::FallbackToEmpty { state, .. } => {
+                assert!(
+                    state.generation.incarnation > 9999,
+                    "incarnation {} must be > 9999 (old)",
+                    state.generation.incarnation
+                );
             }
             _ => panic!("expected FallbackToEmpty"),
         }
