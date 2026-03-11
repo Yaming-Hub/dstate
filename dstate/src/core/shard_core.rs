@@ -451,11 +451,15 @@ where
 
     /// Query the view map with a freshness requirement.
     ///
-    /// Checks every peer's view for staleness (by elapsed time since
-    /// `synced_at` or by `pending_remote_generation`). If all views are
-    /// fresh, runs the projection and returns [`QueryResult::Fresh`].
-    /// Otherwise, returns [`QueryResult::StalePeersDetected`] with the
-    /// list of stale peers so the actor shell can pull and re-query.
+    /// Takes a snapshot of the view map and checks every peer's view for
+    /// staleness (by elapsed time since `synced_at` or by
+    /// `pending_remote_generation`). The projection always runs against
+    /// the captured snapshot regardless of staleness — this lets the actor
+    /// shell use the result immediately or discard it after pulling.
+    ///
+    /// Returns [`QueryResult::Fresh`] if all peers are within
+    /// `max_staleness`, or [`QueryResult::StalePeersDetected`] with the
+    /// stale peer list and the (potentially stale) projection result.
     ///
     /// The local node's own entry is never considered stale.
     pub fn query_local<R, F>(&self, max_staleness: Duration, project: F) -> QueryResult<R>
@@ -463,7 +467,20 @@ where
         F: FnOnce(&HashMap<NodeId, StateViewObject<V>>) -> R,
     {
         let snapshot = self.views.snapshot();
-        let stale = self.views.stale_peers(self.node_id, max_staleness, &*self.clock);
+        let now = self.clock.now();
+
+        // Check staleness against the same snapshot used for projection
+        // to avoid TOCTOU races between snapshot() and stale_peers().
+        let stale: Vec<NodeId> = snapshot
+            .iter()
+            .filter(|(id, _)| **id != self.node_id)
+            .filter(|(_, view)| {
+                view.pending_remote_generation.is_some()
+                    || now.duration_since(view.synced_at) > max_staleness
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
         let result = project(&snapshot);
         if stale.is_empty() {
             QueryResult::Fresh(result)
