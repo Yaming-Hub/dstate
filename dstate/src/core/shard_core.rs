@@ -37,6 +37,39 @@ pub(crate) struct DeltaMutationOutcome<V: Clone, VD: Clone> {
 }
 
 #[allow(dead_code)] // Used by tests and future actor shell
+/// A mutation that has been applied to a clone of the state but not yet
+/// committed. The caller should persist `state()` and then call
+/// `ShardCore::commit_mutation` on success.
+pub(crate) struct PreparedMutation<S: Clone, V: Clone> {
+    pub(crate) new_state: StateObject<S>,
+    pub(crate) view: V,
+}
+
+#[allow(dead_code)]
+impl<S: Clone, V: Clone> PreparedMutation<S, V> {
+    /// The state to persist before committing.
+    pub fn state(&self) -> &StateObject<S> {
+        &self.new_state
+    }
+}
+
+#[allow(dead_code)] // Used by tests and future actor shell
+/// A delta mutation that has been applied to a clone but not yet committed.
+pub(crate) struct PreparedDeltaMutation<S: Clone, V: Clone, VD: Clone> {
+    pub(crate) new_state: StateObject<S>,
+    pub(crate) view: V,
+    pub(crate) view_delta: VD,
+}
+
+#[allow(dead_code)]
+impl<S: Clone, V: Clone, VD: Clone> PreparedDeltaMutation<S, V, VD> {
+    /// The state to persist before committing.
+    pub fn state(&self) -> &StateObject<S> {
+        &self.new_state
+    }
+}
+
+#[allow(dead_code)] // Used by tests and future actor shell
 /// Result of attempting to accept an inbound snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AcceptResult {
@@ -258,6 +291,94 @@ where
             generation: self.state.generation,
             view,
             view_delta,
+        }
+    }
+
+    // ── Two-phase mutation (persist-before-publish) ────────────
+
+    /// Phase 1: Prepare a mutation without modifying state or view map.
+    ///
+    /// Clones the state, applies the mutation to the clone, and computes
+    /// the new view. The caller should persist `prepared.state()` and then
+    /// call [`commit_mutation`] on success, or simply drop the prepared
+    /// value on failure (state remains unchanged).
+    pub fn prepare_mutation<F, P>(
+        &self,
+        mutate_fn: F,
+        project_fn: P,
+    ) -> PreparedMutation<S, V>
+    where
+        F: FnOnce(&mut S),
+        P: FnOnce(&S) -> V,
+    {
+        let mut new_state = self.state.clone();
+        mutate_fn(&mut new_state.value);
+        new_state.generation.age += 1;
+        new_state.modified_time = self.clock.unix_ms();
+
+        let view = project_fn(&new_state.value);
+
+        PreparedMutation { new_state, view }
+    }
+
+    /// Phase 2: Commit a previously prepared mutation.
+    ///
+    /// Replaces the owned state and updates the local view map entry.
+    /// Only call after persistence succeeds.
+    pub fn commit_mutation(
+        &mut self,
+        prepared: PreparedMutation<S, V>,
+    ) -> MutationOutcome<V> {
+        self.state = prepared.new_state;
+        self.update_own_view(prepared.view.clone());
+
+        MutationOutcome {
+            generation: self.state.generation,
+            view: prepared.view,
+        }
+    }
+
+    /// Phase 1 (delta-aware): Prepare a delta mutation without modifying
+    /// state or view map.
+    pub fn prepare_mutation_with_delta<F, PV, PD, DC, VD>(
+        &self,
+        mutate_fn: F,
+        project_view_fn: PV,
+        project_delta_fn: PD,
+    ) -> PreparedDeltaMutation<S, V, VD>
+    where
+        F: FnOnce(&mut S) -> DC,
+        PV: FnOnce(&S) -> V,
+        PD: FnOnce(&DC) -> VD,
+        VD: Clone + Debug,
+    {
+        let mut new_state = self.state.clone();
+        let delta_change = mutate_fn(&mut new_state.value);
+        new_state.generation.age += 1;
+        new_state.modified_time = self.clock.unix_ms();
+
+        let view = project_view_fn(&new_state.value);
+        let view_delta = project_delta_fn(&delta_change);
+
+        PreparedDeltaMutation {
+            new_state,
+            view,
+            view_delta,
+        }
+    }
+
+    /// Phase 2 (delta-aware): Commit a previously prepared delta mutation.
+    pub fn commit_delta_mutation<VD: Clone + Debug>(
+        &mut self,
+        prepared: PreparedDeltaMutation<S, V, VD>,
+    ) -> DeltaMutationOutcome<V, VD> {
+        self.state = prepared.new_state;
+        self.update_own_view(prepared.view.clone());
+
+        DeltaMutationOutcome {
+            generation: self.state.generation,
+            view: prepared.view,
+            view_delta: prepared.view_delta,
         }
     }
 
@@ -2001,5 +2122,261 @@ mod tests {
 
         let stale3 = shard.stale_peers(Duration::from_secs(5));
         assert!(stale3.is_empty());
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Persist-before-publish (two-phase mutation) tests
+    // ═══════════════════════════════════════════════════════════
+
+    // ── PERSIST-01: save() called after each mutation ────────────
+
+    #[test]
+    fn persist_01_prepare_returns_state_to_persist() {
+        let clock = test_clock();
+        let shard = make_shard(clock.clone());
+
+        // Three prepare calls — each returns the next state to persist
+        let p1 = shard.prepare_mutation(|s| s.counter = 1, |s| s.clone());
+        assert_eq!(p1.state().generation.age, 1);
+        assert_eq!(p1.state().value.counter, 1);
+
+        // Without committing p1, shard is unchanged — but we can still
+        // prepare again (would produce same age since shard hasn't changed)
+        let p1b = shard.prepare_mutation(|s| s.counter = 10, |s| s.clone());
+        assert_eq!(p1b.state().generation.age, 1);
+        assert_eq!(p1b.state().value.counter, 10);
+    }
+
+    // ── PERSIST-03: State survives actor restart (simulation) ────
+
+    #[test]
+    fn persist_03_state_survives_restart() {
+        let clock = test_clock();
+        let mut shard = make_shard(clock.clone());
+
+        // Mutate to age 5
+        for i in 1..=5 {
+            let prepared = shard.prepare_mutation(
+                move |s| s.counter = i,
+                |s| s.clone(),
+            );
+            // Simulate successful persist
+            shard.commit_mutation(prepared);
+        }
+        let saved = shard.state().clone();
+        assert_eq!(saved.generation.age, 5);
+        assert_eq!(saved.value.counter, 5);
+
+        // Simulate restart — create new shard from saved state
+        let shard2 = ShardCore::new(
+            NodeId(1),
+            saved.clone(),
+            saved.value.clone(),
+            clock,
+        );
+        assert_eq!(shard2.state().generation.age, 5);
+        assert_eq!(shard2.state().value.counter, 5);
+    }
+
+    // ── PERSIST-04: No persistence when disabled ─────────────────
+
+    #[test]
+    fn persist_04_no_persistence_direct_commit() {
+        let clock = test_clock();
+        let mut shard = make_shard(clock);
+
+        // When persistence is disabled, the actor shell calls
+        // prepare + commit without persisting in between.
+        let prepared = shard.prepare_mutation(|s| s.counter = 42, |s| s.clone());
+        let outcome = shard.commit_mutation(prepared);
+
+        assert_eq!(outcome.generation.age, 1);
+        assert_eq!(shard.state().value.counter, 42);
+    }
+
+    // ── PERSIST-05 / ERR-03: Save failure returns no outcome ─────
+
+    #[test]
+    fn persist_05_err_03_save_failure_no_commit() {
+        let clock = test_clock();
+        let shard = make_shard(clock);
+
+        // Prepare a mutation
+        let _prepared = shard.prepare_mutation(|s| s.counter = 99, |s| s.clone());
+
+        // Simulate save failure — just drop the prepared value.
+        // The MutationError::PersistenceFailed is constructed by the actor
+        // shell. Here we verify that dropping the prepared value leaves
+        // shard state unchanged.
+        drop(_prepared);
+
+        assert_eq!(shard.state().generation.age, 0);
+        assert_eq!(shard.state().value.counter, 0);
+    }
+
+    // ── PERSIST-07: Save failure prevents age advance ────────────
+
+    #[test]
+    fn persist_07_save_failure_prevents_age_advance() {
+        let clock = test_clock();
+        let mut shard = make_shard(clock);
+
+        // Successful mutation to age 3
+        for _ in 0..3 {
+            let p = shard.prepare_mutation(|s| s.counter += 1, |s| s.clone());
+            shard.commit_mutation(p);
+        }
+        assert_eq!(shard.state().generation.age, 3);
+
+        // Next mutation: prepare succeeds but "save fails" → don't commit
+        let prepared = shard.prepare_mutation(|s| s.counter += 1, |s| s.clone());
+        assert_eq!(prepared.state().generation.age, 4);
+        drop(prepared); // simulate save failure
+
+        // Age is still 3
+        assert_eq!(shard.state().generation.age, 3);
+        assert_eq!(shard.state().value.counter, 3);
+    }
+
+    // ── PERSIST-08: Save failure leaves view_map unchanged ───────
+
+    #[test]
+    fn persist_08_save_failure_viewmap_unchanged() {
+        let clock = test_clock();
+        let mut shard = make_shard(clock);
+
+        shard.apply_mutation(|s| s.counter = 5, |s| s.clone());
+        let view_before = shard.get_view(&NodeId(1)).unwrap();
+        assert_eq!(view_before.value.counter, 5);
+
+        // Prepare mutation but don't commit (save failure)
+        let prepared = shard.prepare_mutation(|s| s.counter = 99, |s| s.clone());
+        drop(prepared);
+
+        // View map still shows counter=5
+        let view_after = shard.get_view(&NodeId(1)).unwrap();
+        assert_eq!(view_after.value.counter, 5);
+        assert_eq!(view_after.generation.age, 1);
+    }
+
+    // ── PERSIST-09: Save failure does not broadcast ──────────────
+
+    #[test]
+    fn persist_09_save_failure_no_broadcast() {
+        let clock = test_clock();
+        let shard = make_shard(clock);
+
+        // Prepare mutation — the outcome that would be broadcast is inside
+        // PreparedMutation. If we drop it, no outcome is returned.
+        let prepared = shard.prepare_mutation(|s| s.counter = 42, |s| s.clone());
+
+        // Verify the prepared mutation has the view that would have been broadcast
+        assert_eq!(prepared.view.counter, 42);
+
+        // Drop it (simulate save failure) — no MutationOutcome returned
+        drop(prepared);
+
+        // State unchanged — nothing to broadcast
+        assert_eq!(shard.state().generation.age, 0);
+    }
+
+    // ── PERSIST-10: Successful save then publish ordering ────────
+
+    #[test]
+    fn persist_10_save_then_publish_ordering() {
+        let clock = test_clock();
+        let mut shard = make_shard(clock);
+
+        // Phase 1: prepare (state not yet changed)
+        let prepared = shard.prepare_mutation(|s| s.counter = 42, |s| s.clone());
+        assert_eq!(shard.state().generation.age, 0, "state unchanged before commit");
+        assert_eq!(
+            shard.get_view(&NodeId(1)).unwrap().value.counter, 0,
+            "view unchanged before commit"
+        );
+
+        // Simulate: persist succeeds here
+        let persisted_state = prepared.state().clone();
+        assert_eq!(persisted_state.generation.age, 1);
+
+        // Phase 2: commit (state + view updated atomically)
+        let outcome = shard.commit_mutation(prepared);
+        assert_eq!(shard.state().generation.age, 1, "state updated after commit");
+        assert_eq!(
+            shard.get_view(&NodeId(1)).unwrap().value.counter, 42,
+            "view updated after commit"
+        );
+        assert_eq!(outcome.generation.age, 1);
+        assert_eq!(outcome.view.counter, 42);
+    }
+
+    // ── Delta-aware two-phase mutation tests ─────────────────────
+
+    #[test]
+    fn persist_delta_prepare_commit_cycle() {
+        let clock = test_clock();
+        let mut shard = make_delta_shard(clock);
+
+        let prepared = shard.prepare_mutation_with_delta(
+            |s| {
+                s.counter += 1;
+                s.label = "updated".into();
+                TestDeltaChange {
+                    counter_delta: 1,
+                    new_label: Some("updated".into()),
+                    accumulator_delta: 0.0,
+                }
+            },
+            |s| TestDeltaState::project_view(s),
+            |dc| TestDeltaState::project_delta(dc),
+        );
+
+        assert_eq!(shard.state().generation.age, 0, "unchanged before commit");
+
+        let outcome = shard.commit_delta_mutation(prepared);
+        assert_eq!(shard.state().generation.age, 1);
+        assert_eq!(outcome.generation.age, 1);
+        assert_eq!(outcome.view.counter, 1);
+    }
+
+    #[test]
+    fn persist_delta_save_failure_rollback() {
+        let clock = test_clock();
+        let mut shard = make_delta_shard(clock);
+
+        // Commit one mutation successfully
+        let p1 = shard.prepare_mutation_with_delta(
+            |s| {
+                s.counter += 1;
+                TestDeltaChange {
+                    counter_delta: 1,
+                    new_label: None,
+                    accumulator_delta: 0.0,
+                }
+            },
+            |s| TestDeltaState::project_view(s),
+            |dc| TestDeltaState::project_delta(dc),
+        );
+        shard.commit_delta_mutation(p1);
+        assert_eq!(shard.state().generation.age, 1);
+
+        // Prepare second mutation but "save fails"
+        let p2 = shard.prepare_mutation_with_delta(
+            |s| {
+                s.counter += 10;
+                TestDeltaChange {
+                    counter_delta: 10,
+                    new_label: None,
+                    accumulator_delta: 0.0,
+                }
+            },
+            |s| TestDeltaState::project_view(s),
+            |dc| TestDeltaState::project_delta(dc),
+        );
+        drop(p2);
+
+        // State unchanged — still at age 1 with counter=1
+        assert_eq!(shard.state().generation.age, 1);
+        assert_eq!(shard.state().value.counter, 1);
     }
 }
