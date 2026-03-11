@@ -126,7 +126,7 @@ impl VersioningLogic {
     /// Determine the action for a version mismatch based on the configured policy.
     pub fn on_deserialize_error(&self, wire_version: u32) -> VersionMismatchAction {
         let reason = format!(
-            "state '{}': received wire_version={}, local supports up to {}",
+            "state '{}': received wire_version={}, local outbound wire_version is {}",
             self.state_name, wire_version, self.current_wire_version,
         );
         match self.policy {
@@ -141,14 +141,18 @@ impl VersioningLogic {
         }
     }
 
-    /// Attempt to load persisted state, falling back to migration if the
-    /// storage version doesn't match.
+    /// Attempt to load persisted state, migrating if the stored version differs
+    /// from the current storage version.
+    ///
+    /// The decision is version-driven: if `stored_version` matches
+    /// `current_storage_version`, the data is deserialized directly.
+    /// If they differ, `migrate_fn` is called to transform the data.
     ///
     /// The caller provides two functions:
-    /// - `deserialize_fn`: tries current storage version
-    /// - `migrate_fn`: tries migration from an older version
+    /// - `deserialize_fn`: deserializes at the current storage version
+    /// - `migrate_fn`: migrates from an older (or unknown) storage version
     ///
-    /// Returns `Ok(state)` on success, or `Err` if both fail.
+    /// Returns `Ok(state)` on success, or `Err` if deserialization/migration fails.
     pub fn try_load_with_migration<S, D, M>(
         &self,
         data: &[u8],
@@ -160,12 +164,10 @@ impl VersioningLogic {
         D: FnOnce(&[u8], u32) -> Result<S, DeserializeError>,
         M: FnOnce(&[u8], u32) -> Result<S, DeserializeError>,
     {
-        match deserialize_fn(data, stored_version) {
-            Ok(state) => Ok(state),
-            Err(DeserializeError::UnknownVersion(_)) => {
-                migrate_fn(data, stored_version)
-            }
-            Err(e) => Err(e),
+        if stored_version == self.current_storage_version {
+            deserialize_fn(data, stored_version)
+        } else {
+            migrate_fn(data, stored_version)
         }
     }
 
@@ -269,7 +271,7 @@ mod tests {
             InboundVersionResult::VersionMismatch(action) => {
                 assert_eq!(action, VersionMismatchAction::KeepStale {
                     wire_version: 3,
-                    reason: "state 'test_state': received wire_version=3, local supports up to 2".into(),
+                    reason: "state 'test_state': received wire_version=3, local outbound wire_version is 2".into(),
                 });
             }
             _ => panic!("expected VersionMismatch"),
@@ -286,7 +288,7 @@ mod tests {
             InboundVersionResult::VersionMismatch(action) => {
                 assert_eq!(action, VersionMismatchAction::DropView {
                     wire_version: 3,
-                    reason: "state 'test_state': received wire_version=3, local supports up to 2".into(),
+                    reason: "state 'test_state': received wire_version=3, local outbound wire_version is 2".into(),
                 });
             }
             _ => panic!("expected VersionMismatch with DropView"),
@@ -408,8 +410,8 @@ mod tests {
         let data = b"old_format_data";
         let result = logic.try_load_with_migration(
             data,
-            1, // stored at V1, current is V2
-            |_, v| Err(DeserializeError::UnknownVersion(v)), // current deserializer rejects V1
+            1, // stored at V1, current is V2 → version mismatch, migrate_fn called
+            |_, _| panic!("deserialize_fn should not be called when versions differ"),
             |d, v| {
                 assert_eq!(v, 1);
                 Ok(format!("migrated:{}", String::from_utf8_lossy(d)))
@@ -426,9 +428,9 @@ mod tests {
         let data = b"future_data";
         let result = logic.try_load_with_migration::<String, _, _>(
             data,
-            99, // future version
+            99, // future version ≠ current → migrate_fn called, which also fails
+            |_, _| panic!("deserialize_fn should not be called when versions differ"),
             |_, v| Err(DeserializeError::UnknownVersion(v)),
-            |_, v| Err(DeserializeError::UnknownVersion(v)), // migration also fails
         );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), DeserializeError::UnknownVersion(99));

@@ -276,8 +276,6 @@ pattern validated by integration tests simulating mixed-version clusters.
   (`core/versioning.rs`):
   - `KeepStale` — keep last good view, log warning
   - `DropAndWait` — remove peer view from PublicViewMap
-  - `RequestReserialization` — request + response flow with
-    `max_supported_version`
 - Multi-version deserialization dispatch (match on `wire_version`)
 - Storage version migration in persistence load path
 - Test fixtures simulating mixed-version clusters (nodes at V1 and V2)

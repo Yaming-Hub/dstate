@@ -172,8 +172,8 @@ map on each change.
 | VER-07 | Receiver supports older wire_version | Node A sends at `WIRE_VERSION = 1`, Node B has deserialization for V1 and V2. Verify Node B applies the view. |
 | VER-08 | Receiver does not support wire_version — KeepStale | Node A sends `WIRE_VERSION = 3`, Node B only supports 1 and 2, policy is `KeepStale`. Verify Node B keeps its last good view and logs a warning. |
 | VER-09 | Receiver does not support wire_version — DropAndWait | Same as VER-08 but policy is `DropAndWait`. Verify Node B removes the peer's view from PublicViewMap. |
-| VER-10 | Receiver does not support wire_version — RequestReserialization | Same as VER-08 but policy is `RequestReserialization`. Verify Node B sends a re-serialization request with its max supported version. |
-| VER-11 | Re-serialization request served by owner | Node B requests re-serialization at version 2. Verify Node A re-serializes and sends a snapshot at version 2. |
+| VER-10 | Malformed data is not treated as version mismatch | Node A sends data that fails deserialization with `Malformed` (not `UnknownVersion`). Verify the result is `MalformedData`, not `VersionMismatch`. |
+| VER-11 | on_deserialize_error produces correct action per policy | Call `on_deserialize_error` directly with both `KeepStale` and `DropAndWait` policies. Verify `KeepStale` returns `KeepStale` action and `DropAndWait` returns `DropView` action. |
 
 ### 4.3 Two-Phase Upgrade — Integration Tests
 
