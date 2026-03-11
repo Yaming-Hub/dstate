@@ -53,9 +53,12 @@ impl<S> StartupOutcome<S> {
     }
 }
 
-/// Pure logic for computing the initial state at actor startup.
+/// Pure logic for computing the initial state at actor startup from
+/// persisted storage.
 ///
 /// Handles:
+/// - Loading persisted state and deciding whether to use, migrate, or
+///   discard it
 /// - Incarnation generation (clock-based for fresh starts, preserved for
 ///   successful loads)
 /// - Storage version comparison and migration dispatch
@@ -77,12 +80,12 @@ impl<S> StartupOutcome<S> {
 /// | Load fails | `clock.unix_ms()` |
 /// | Migration fails | `clock.unix_ms()` (new incarnation) |
 #[allow(dead_code)]
-pub(crate) struct StartupLogic {
+pub(crate) struct PersistenceStartupLogic {
     current_storage_version: u32,
 }
 
 #[allow(dead_code)]
-impl StartupLogic {
+impl PersistenceStartupLogic {
     pub fn new(current_storage_version: u32) -> Self {
         Self {
             current_storage_version,
@@ -171,7 +174,7 @@ mod tests {
     #[test]
     fn inc_04_fresh_startup_incarnation_from_clock() {
         let clock = make_clock();
-        let logic = StartupLogic::new(1);
+        let logic = PersistenceStartupLogic::new(1);
 
         let outcome = logic.initialize::<String, _>(
             Ok(None),
@@ -196,7 +199,7 @@ mod tests {
     #[test]
     fn inc_05_loaded_incarnation_preserved() {
         let clock = make_clock();
-        let logic = StartupLogic::new(1);
+        let logic = PersistenceStartupLogic::new(1);
 
         let loaded = StateObject {
             generation: Generation::new(42, 5),
@@ -229,7 +232,7 @@ mod tests {
     #[test]
     fn inc_06_migration_failure_new_incarnation() {
         let clock = make_clock();
-        let logic = StartupLogic::new(2); // current version is 2
+        let logic = PersistenceStartupLogic::new(2); // current version is 2
 
         let loaded = StateObject {
             generation: Generation::new(42, 5),
@@ -263,7 +266,7 @@ mod tests {
     #[test]
     fn persist_06_load_none_fresh_start() {
         let clock = make_clock();
-        let logic = StartupLogic::new(1);
+        let logic = PersistenceStartupLogic::new(1);
 
         let outcome = logic.initialize::<u64, _>(
             Ok(None),
@@ -282,7 +285,7 @@ mod tests {
     #[test]
     fn persist_11_load_error_fallback() {
         let clock = make_clock();
-        let logic = StartupLogic::new(1);
+        let logic = PersistenceStartupLogic::new(1);
 
         let outcome = logic.initialize::<String, _>(
             Err(PersistError::StorageUnavailable("disk full".into())),
@@ -306,7 +309,7 @@ mod tests {
     #[test]
     fn persist_12_load_error_reason_captured() {
         let clock = make_clock();
-        let logic = StartupLogic::new(1);
+        let logic = PersistenceStartupLogic::new(1);
 
         let outcome = logic.initialize::<String, _>(
             Err(PersistError::Io("connection refused".into())),
@@ -328,7 +331,7 @@ mod tests {
     #[test]
     fn persist_13_same_version_used_as_is() {
         let clock = make_clock();
-        let logic = StartupLogic::new(1);
+        let logic = PersistenceStartupLogic::new(1);
 
         let loaded = StateObject {
             generation: Generation::new(100, 7),
@@ -358,7 +361,7 @@ mod tests {
     #[test]
     fn persist_14_different_version_triggers_migration() {
         let clock = make_clock();
-        let logic = StartupLogic::new(2);
+        let logic = PersistenceStartupLogic::new(2);
 
         let loaded = StateObject {
             generation: Generation::new(100, 7),
@@ -395,7 +398,7 @@ mod tests {
     #[test]
     fn persist_15_migration_failure_fallback() {
         let clock = make_clock();
-        let logic = StartupLogic::new(2);
+        let logic = PersistenceStartupLogic::new(2);
 
         let loaded = StateObject {
             generation: Generation::new(100, 7),
@@ -429,7 +432,7 @@ mod tests {
     #[test]
     fn persist_16_migration_preserves_metadata() {
         let clock = make_clock();
-        let logic = StartupLogic::new(3);
+        let logic = PersistenceStartupLogic::new(3);
 
         let loaded = StateObject {
             generation: Generation::new(42, 10),
