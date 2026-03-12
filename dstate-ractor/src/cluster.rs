@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use dstate::{ClusterError, ClusterEvent, ClusterEvents, SubscriptionId};
 
-type SubscriberMap = HashMap<SubscriptionId, Box<dyn Fn(ClusterEvent) + Send + Sync>>;
+type SubscriberMap = HashMap<SubscriptionId, Arc<dyn Fn(ClusterEvent) + Send + Sync>>;
 
 /// A dstate `ClusterEvents` implementation for the ractor adapter.
 ///
@@ -28,11 +28,18 @@ impl RactorClusterEvents {
 
     /// Emit a cluster event, notifying all subscribers.
     ///
+    /// Callbacks are snapshot-cloned before invocation so that subscribers
+    /// may safely call `subscribe` or `unsubscribe` from within a callback
+    /// without deadlocking.
+    ///
     /// In production, this would be driven by `ractor_cluster` membership
     /// change notifications. For testing, call this directly.
     pub fn emit(&self, event: ClusterEvent) {
-        let subs = self.subscribers.lock().unwrap();
-        for sub in subs.values() {
+        let snapshot: Vec<_> = {
+            let subs = self.subscribers.lock().unwrap();
+            subs.values().cloned().collect()
+        };
+        for sub in snapshot {
             sub(event.clone());
         }
     }
@@ -51,7 +58,7 @@ impl ClusterEvents for RactorClusterEvents {
     ) -> Result<SubscriptionId, ClusterError> {
         let id = SubscriptionId::from_raw(self.next_id.fetch_add(1, Ordering::SeqCst));
         let mut subs = self.subscribers.lock().unwrap();
-        subs.insert(id, on_event);
+        subs.insert(id, Arc::from(on_event));
         Ok(id)
     }
 

@@ -86,10 +86,6 @@ impl<M: Send + 'static> std::fmt::Debug for RactorActorRef<M> {
     }
 }
 
-// Safety: ractor::ActorRef<M> is Send + Sync
-unsafe impl<M: Send + 'static> Send for RactorActorRef<M> {}
-unsafe impl<M: Send + 'static> Sync for RactorActorRef<M> {}
-
 impl<M: Send + 'static> DstateActorRef<M> for RactorActorRef<M> {
     fn send(&self, msg: M) -> Result<(), ActorSendError> {
         self.inner
@@ -132,8 +128,13 @@ struct RefWrapper<M: Send + 'static>(ractor::ActorRef<M>);
 /// A dstate `ActorRuntime` implementation backed by ractor.
 ///
 /// Actors are spawned as ractor actors via [`ractor::Actor::spawn`]. The
-/// sync-to-async bridge uses a dedicated background thread so the caller
-/// does not need to be inside a tokio async context.
+/// sync-to-async bridge uses a dedicated background thread with
+/// [`tokio::runtime::Handle::block_on`], so the caller must be within a
+/// tokio runtime context (i.e. `Handle::current()` must succeed).
+///
+/// **Performance note:** Each `spawn()` call creates a short-lived OS thread
+/// to bridge the sync/async boundary. This is heavier than native ractor
+/// spawning but is required by the synchronous `ActorRuntime::spawn` API.
 ///
 /// Process groups are maintained in a local registry with type-erased refs.
 /// Cluster events use a callback-based subscription model.
