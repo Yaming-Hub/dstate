@@ -59,6 +59,15 @@ pub enum ClusterEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(pub(crate) u64);
 
+impl SubscriptionId {
+    /// Create a new `SubscriptionId` from a raw integer.
+    ///
+    /// Intended for use by adapter crates implementing `ClusterEvents`.
+    pub fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Abstract traits
 // ---------------------------------------------------------------------------
