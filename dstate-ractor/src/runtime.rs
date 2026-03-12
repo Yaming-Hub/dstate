@@ -99,13 +99,24 @@ impl<M: Send + 'static> DstateActorRef<M> for RactorActorRef<M> {
 // ---------------------------------------------------------------------------
 
 /// A dstate `TimerHandle` backed by a tokio `JoinHandle`.
-/// Cancel aborts the background task.
+///
+/// Calling [`cancel()`](TimerHandle::cancel) aborts the background task.
+/// Dropping the handle without calling `cancel()` also aborts the task
+/// via the [`Drop`] implementation, preventing resource leaks.
 pub struct RactorTimerHandle {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TimerHandle for RactorTimerHandle {
     fn cancel(mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+
+impl Drop for RactorTimerHandle {
+    fn drop(&mut self) {
         if let Some(h) = self.handle.take() {
             h.abort();
         }
@@ -127,16 +138,25 @@ struct RefWrapper<M: Send + 'static>(ractor::ActorRef<M>);
 
 /// A dstate `ActorRuntime` implementation backed by ractor.
 ///
-/// Actors are spawned as ractor actors via [`ractor::Actor::spawn`]. The
-/// sync-to-async bridge uses a dedicated background thread with
-/// [`tokio::runtime::Handle::block_on`], so the caller must be within a
-/// tokio runtime context (i.e. `Handle::current()` must succeed).
+/// # Tokio Runtime Requirement
+///
+/// All methods that interact with the async ractor/tokio layer require a
+/// running tokio runtime context. This includes [`spawn`](DstateActorRuntime::spawn),
+/// [`send_interval`](DstateActorRuntime::send_interval), and
+/// [`send_after`](DstateActorRuntime::send_after). Calling these outside a
+/// tokio runtime will panic (`Handle::current()` / `tokio::spawn`).
 ///
 /// **Performance note:** Each `spawn()` call creates a short-lived OS thread
 /// to bridge the sync/async boundary. This is heavier than native ractor
 /// spawning but is required by the synchronous `ActorRuntime::spawn` API.
 ///
-/// Process groups are maintained in a local registry with type-erased refs.
+/// # Processing Groups
+///
+/// Groups are maintained in a local type-erased registry. A single group name
+/// can hold actors of different message types; `broadcast_group::<M>` delivers
+/// only to members whose message type matches `M`, silently skipping others.
+/// Callers should use distinct group names per message type to avoid confusion.
+///
 /// Cluster events use a callback-based subscription model.
 #[derive(Clone)]
 pub struct RactorRuntime {

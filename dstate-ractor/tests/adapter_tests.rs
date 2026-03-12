@@ -411,3 +411,95 @@ async fn empty_group_get_members_returns_empty() {
     let members = rt.get_group_members::<u64>("nonexistent").unwrap();
     assert!(members.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Timer handle Drop aborts the task (no leak on drop without cancel)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn timer_drop_aborts_interval() {
+    let rt = RactorRuntime::new();
+    let count = Arc::new(AtomicU64::new(0));
+    let c = count.clone();
+
+    let actor = rt.spawn("timer_drop", move |_msg: u64| {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+
+    {
+        let _timer = rt.send_interval(&actor, Duration::from_millis(20), 1u64);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // _timer dropped here without calling cancel()
+    }
+
+    let count_at_drop = count.load(Ordering::SeqCst);
+    assert!(count_at_drop > 0, "timer should have fired before drop");
+
+    // After drop, no more messages should arrive
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let count_after = count.load(Ordering::SeqCst);
+    assert_eq!(count_at_drop, count_after, "timer should stop after handle drop");
+}
+
+#[tokio::test]
+async fn timer_drop_aborts_send_after() {
+    let rt = RactorRuntime::new();
+    let count = Arc::new(AtomicU64::new(0));
+    let c = count.clone();
+
+    let actor = rt.spawn("timer_drop_after", move |_msg: u64| {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+
+    {
+        let _timer = rt.send_after(&actor, Duration::from_millis(200), 1u64);
+        // _timer dropped immediately — should abort before firing
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(count.load(Ordering::SeqCst), 0, "send_after should not fire after drop");
+}
+
+// ---------------------------------------------------------------------------
+// Group type mismatch: broadcast with wrong type is a silent no-op
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn group_type_mismatch_broadcast_is_noop() {
+    let rt = RactorRuntime::new();
+    let received = Arc::new(AtomicU64::new(0));
+    let r = received.clone();
+
+    // Join with u64 message type
+    let actor = rt.spawn("type_mismatch", move |msg: u64| {
+        r.fetch_add(msg, Ordering::SeqCst);
+    });
+    rt.join_group("mixed", &actor).unwrap();
+
+    // Broadcast with String type — should silently skip the u64 actor
+    rt.broadcast_group::<String>("mixed", "hello".to_string()).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(received.load(Ordering::SeqCst), 0, "mismatched type should not deliver");
+
+    // Broadcast with correct type — should deliver
+    rt.broadcast_group::<u64>("mixed", 10).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(received.load(Ordering::SeqCst), 10, "correct type should deliver");
+}
+
+#[tokio::test]
+async fn group_get_members_wrong_type_returns_empty() {
+    let rt = RactorRuntime::new();
+    let actor = rt.spawn::<u64, _>("member_type", move |_| {});
+    rt.join_group("typed", &actor).unwrap();
+
+    // Query with wrong type returns empty
+    let members = rt.get_group_members::<String>("typed").unwrap();
+    assert!(members.is_empty(), "wrong type should return no members");
+
+    // Query with correct type returns the member
+    let members = rt.get_group_members::<u64>("typed").unwrap();
+    assert_eq!(members.len(), 1);
+}
