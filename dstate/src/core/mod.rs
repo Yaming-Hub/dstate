@@ -1,5 +1,6 @@
 pub(crate) mod change_feed_logic;
 pub(crate) mod delta_accumulator;
+pub(crate) mod diagnostics;
 pub(crate) mod lifecycle_logic;
 pub(crate) mod shard_core;
 pub(crate) mod persistence_startup_logic;

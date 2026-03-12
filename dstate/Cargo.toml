@@ -16,3 +16,4 @@ uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tracing-test = "0.2"

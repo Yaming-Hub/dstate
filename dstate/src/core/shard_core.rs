@@ -197,6 +197,11 @@ where
         self.node_id
     }
 
+    /// Access the clock used by this shard.
+    pub fn clock(&self) -> &dyn Clock {
+        self.clock.as_ref()
+    }
+
     /// Read-only access to the owned state.
     pub fn state(&self) -> &StateObject<S> {
         &self.state
