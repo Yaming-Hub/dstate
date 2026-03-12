@@ -333,6 +333,8 @@ impl DiagnosticsLogic {
             }
             total_peers += 1;
 
+            // If checked_duration_since returns None (now < synced_at due to
+            // a view update racing with our snapshot), treat the peer as fresh.
             let is_stale = view.pending_remote_generation.is_some()
                 || now
                     .checked_duration_since(view.synced_at)
@@ -918,5 +920,31 @@ mod tests {
         diag.record_snapshot_received(NodeId(2), 3, clock.as_ref());
         assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 0);
         assert_eq!(diag.metrics().snapshots_received, 1);
+    }
+
+    // ── DIAG-27: stale+failing overlap doesn't break classification ──
+
+    #[test]
+    fn diag_27_stale_and_failing_overlap() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+
+        // 3-node cluster: self + 2 peers
+        let shard = make_3_node_shard(clock.clone());
+
+        // Advance time → both peers become stale
+        tc.advance(Duration::from_secs(30));
+
+        // Also record failures on node 2 → both stale AND failing
+        let mut diag = DiagnosticsLogic::new("test_state".into());
+        diag.record_sync_failure(NodeId(2), "timeout", clock.as_ref());
+
+        let health = diag.health_status(&shard, Duration::from_secs(10));
+        // Node 2: stale + failing, Node 3: stale only
+        assert_eq!(health.stale_peers, 2);
+        assert_eq!(health.failing_peers, 1);
+        // stale_peers + failing_peers (3) > total peers (2) — overlap is expected
+        assert_eq!(health.healthy_peers, 0);
+        assert_eq!(health.status, HealthStatus::Unhealthy);
     }
 }
