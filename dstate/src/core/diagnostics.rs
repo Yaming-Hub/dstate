@@ -155,7 +155,10 @@ impl DiagnosticsLogic {
 
     // ── Recording methods ───────────────────────────────────────
 
-    /// Record a successful sync (snapshot received) from a peer.
+    /// Record a successful inbound sync (delta or snapshot applied) from a peer.
+    ///
+    /// Resets consecutive failures, updates latency and timestamps.
+    /// Called by `record_delta_received` and `record_snapshot_received`.
     pub fn record_sync_success(&mut self, peer: NodeId, latency_ms: u64, clock: &dyn Clock) {
         let now = clock.unix_ms();
         let diag = self.peers.entry(peer).or_default();
@@ -165,7 +168,7 @@ impl DiagnosticsLogic {
         diag.last_error = None;
         diag.last_sync_latency_ms = Some(latency_ms);
 
-        tracing::info!(
+        tracing::debug!(
             state_name = %self.state_name,
             peer = ?peer,
             latency_ms = latency_ms,
@@ -298,10 +301,13 @@ impl DiagnosticsLogic {
     /// - **stale**: synced_at older than `max_staleness` or has pending_remote_generation
     /// - **failing**: has `consecutive_failures > 0`
     ///
-    /// Health classification:
+    /// Note: a peer can be both stale and failing, so `stale_peers + failing_peers`
+    /// may exceed the total peer count.
+    ///
+    /// Health classification uses **strict majority** (>50%):
     /// - `Healthy`: all non-local peers are healthy
-    /// - `Degraded`: some peers stale/failing, but majority (>50%) healthy
-    /// - `Unhealthy`: majority of peers are stale/failing
+    /// - `Degraded`: some peers stale/failing, but strict majority healthy
+    /// - `Unhealthy`: half or more peers are stale/failing
     pub fn health_status<S, V>(
         &self,
         shard: &ShardCore<S, V>,
@@ -319,14 +325,18 @@ impl DiagnosticsLogic {
         let mut healthy: u32 = 0;
         let mut stale: u32 = 0;
         let mut failing: u32 = 0;
+        let mut total_peers: u32 = 0;
 
         for (node_id, view) in &snapshot {
             if *node_id == local_id {
                 continue; // skip self
             }
+            total_peers += 1;
 
             let is_stale = view.pending_remote_generation.is_some()
-                || now.duration_since(view.synced_at) > max_staleness;
+                || now
+                    .checked_duration_since(view.synced_at)
+                    .map_or(false, |d| d > max_staleness);
 
             let diag = self.peers.get(node_id);
             let is_failing = diag.map_or(false, |d| d.consecutive_failures > 0);
@@ -343,7 +353,6 @@ impl DiagnosticsLogic {
             }
         }
 
-        let total_peers = healthy + stale.max(failing);
         let status = if stale == 0 && failing == 0 {
             HealthStatus::Healthy
         } else if total_peers > 0 && healthy > total_peers / 2 {
@@ -361,6 +370,14 @@ impl DiagnosticsLogic {
         }
     }
 
+    /// Remove tracking data for a departed peer.
+    ///
+    /// Should be called when `LifecycleLogic` processes a node leave,
+    /// to prevent unbounded growth of the `peers` map on node churn.
+    pub fn remove_peer(&mut self, peer: &NodeId) {
+        self.peers.remove(peer);
+    }
+
     /// The state name this diagnostics instance tracks.
     pub fn state_name(&self) -> &str {
         &self.state_name
@@ -370,6 +387,7 @@ impl DiagnosticsLogic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::core::shard_core::{new_state_object, InboundSnapshot, ShardCore};
     use crate::test_support::test_clock::TestClock;
     use crate::test_support::test_state::TestState;
@@ -740,11 +758,11 @@ mod tests {
         assert_eq!(states[1].state_name, "state_b");
     }
 
-    // ── DIAG-20: Sync success emits INFO log ────────────────────
+    // ── DIAG-20: Sync success emits DEBUG log ───────────────────
 
     #[traced_test]
     #[test]
-    fn diag_20_sync_success_info_log() {
+    fn diag_20_sync_success_debug_log() {
         let clock = test_clock();
         let mut diag = DiagnosticsLogic::new("node_resource".into());
 
@@ -782,5 +800,123 @@ mod tests {
 
         assert!(logs_contain("delta suppressed"));
         assert!(logs_contain("suppressed_count"));
+    }
+
+    // ── DIAG-23: Single-node cluster is Healthy ─────────────────
+
+    #[test]
+    fn diag_23_single_node_healthy() {
+        let clock = test_clock();
+        let shard = make_shard(clock.clone()); // only self, no peers
+        let diag = DiagnosticsLogic::new("test_state".into());
+
+        let health = diag.health_status(&shard, Duration::from_secs(10));
+        assert_eq!(health.status, HealthStatus::Healthy);
+        assert_eq!(health.healthy_peers, 0);
+        assert_eq!(health.stale_peers, 0);
+        assert_eq!(health.failing_peers, 0);
+    }
+
+    // ── DIAG-24: Disjoint stale and failing peers counted correctly ──
+
+    #[test]
+    fn diag_24_disjoint_stale_and_failing() {
+        let tc = TestClock::with_base_unix_ms(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(tc.clone());
+
+        // 5-node cluster: self + 4 peers
+        let shard = make_shard(clock.clone());
+        for id in [2, 3, 4, 5] {
+            shard.on_node_joined(NodeId(id), TestState { counter: 0, label: "".into() });
+        }
+        let now_ms = clock.unix_ms();
+        for id in [2, 3, 4, 5] {
+            shard.accept_inbound_snapshot(InboundSnapshot {
+                source: NodeId(id),
+                generation: Generation::new(id as u64 * 100, 1),
+                wire_version: 1,
+                view: TestState { counter: 1, label: format!("n{}", id) },
+                created_time: now_ms,
+                modified_time: now_ms,
+            });
+        }
+
+        // Advance time to make all stale
+        tc.advance(Duration::from_secs(30));
+
+        // Refresh nodes 2 and 3 (fresh), leave node 4 stale
+        for id in [2, 3] {
+            shard.accept_inbound_snapshot(InboundSnapshot {
+                source: NodeId(id),
+                generation: Generation::new(id as u64 * 100, 2),
+                wire_version: 1,
+                view: TestState { counter: 2, label: format!("n{}", id) },
+                created_time: clock.unix_ms(),
+                modified_time: clock.unix_ms(),
+            });
+        }
+
+        // Node 5 is fresh but failing (record failure)
+        let mut diag = DiagnosticsLogic::new("test_state".into());
+        diag.record_sync_failure(NodeId(5), "connection refused", clock.as_ref());
+
+        // Refresh node 5 view so it's NOT stale, but HAS consecutive_failures
+        shard.accept_inbound_snapshot(InboundSnapshot {
+            source: NodeId(5),
+            generation: Generation::new(500, 2),
+            wire_version: 1,
+            view: TestState { counter: 2, label: "n5".into() },
+            created_time: clock.unix_ms(),
+            modified_time: clock.unix_ms(),
+        });
+
+        // Now: node 2 healthy, node 3 healthy, node 4 stale-only, node 5 failing-only
+        // Total = 4, healthy = 2, 2 > 4/2 = 2 → FALSE → Unhealthy (strict majority)
+        let health = diag.health_status(&shard, Duration::from_secs(10));
+        assert_eq!(health.healthy_peers, 2);
+        assert_eq!(health.stale_peers, 1);   // node 4
+        assert_eq!(health.failing_peers, 1); // node 5
+        assert_eq!(health.status, HealthStatus::Unhealthy);
+    }
+
+    // ── DIAG-25: remove_peer cleans up departed node ────────────
+
+    #[test]
+    fn diag_25_remove_peer() {
+        let clock = test_clock();
+        let mut diag = DiagnosticsLogic::new("test_state".into());
+
+        diag.record_sync_failure(NodeId(2), "err", clock.as_ref());
+        assert_eq!(diag.peers.len(), 1);
+
+        diag.remove_peer(&NodeId(2));
+        assert_eq!(diag.peers.len(), 0);
+    }
+
+    // ── DIAG-26: delta/snapshot received resets failures ─────────
+
+    #[test]
+    fn diag_26_inbound_resets_failures() {
+        let clock = test_clock();
+        let mut diag = DiagnosticsLogic::new("test_state".into());
+
+        // Build up failures
+        diag.record_sync_failure(NodeId(2), "err1", clock.as_ref());
+        diag.record_sync_failure(NodeId(2), "err2", clock.as_ref());
+        assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 2);
+
+        // Delta received clears failures
+        diag.record_delta_received(NodeId(2), 5, clock.as_ref());
+        assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 0);
+        assert_eq!(diag.metrics().deltas_received, 1);
+
+        // Build up again
+        diag.record_sync_failure(NodeId(2), "err3", clock.as_ref());
+        assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 1);
+
+        // Snapshot received clears failures
+        diag.record_snapshot_received(NodeId(2), 3, clock.as_ref());
+        assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 0);
+        assert_eq!(diag.metrics().snapshots_received, 1);
     }
 }
