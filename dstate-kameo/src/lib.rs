@@ -1,2 +1,33 @@
-// Kameo adapter for dstate — implementation in a future PR.
+//! # dstate-kameo
+//!
+//! Kameo adapter for the [`dstate`] distributed state crate.
+//!
+//! This crate provides [`KameoRuntime`], an implementation of
+//! [`dstate::ActorRuntime`] backed by kameo actors.
+//! Actors are spawned as real kameo actors via kameo's `Spawn::spawn`,
+//! and messages are delivered through kameo's mailbox system.
+//!
+//! # Quick start
+//!
+//! ```rust,no_run
+//! use dstate_kameo::KameoRuntime;
+//! use dstate::{ActorRuntime, ActorRef};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let runtime = KameoRuntime::new();
+//!     let actor = runtime.spawn("greeter", |msg: String| {
+//!         println!("Got: {msg}");
+//!     });
+//!     actor.send("hello".into()).unwrap();
+//! }
+//! ```
+
+pub mod cluster;
+pub mod runtime;
+
+pub use cluster::KameoClusterEvents;
+pub use runtime::{KameoActorRef, KameoRuntime, KameoTimerHandle};
+
+// Re-export the core dstate crate for convenience
 pub use dstate;
