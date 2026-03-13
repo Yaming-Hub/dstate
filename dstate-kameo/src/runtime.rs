@@ -206,7 +206,10 @@ impl DstateActorRuntime for KameoRuntime {
             ticker.tick().await; // first tick is immediate — skip it
             loop {
                 ticker.tick().await;
-                if actor_ref.tell(msg.clone()).send().await.is_err() {
+                // Use try_send() to stay non-blocking (fire-and-forget), matching
+                // the semantics of ActorRef::send(). This avoids backpressure stalls
+                // when the actor's bounded mailbox is full.
+                if actor_ref.tell(msg.clone()).try_send().is_err() {
                     break;
                 }
             }
@@ -225,7 +228,9 @@ impl DstateActorRuntime for KameoRuntime {
         let actor_ref = target.inner.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let _ = actor_ref.tell(msg).send().await;
+            // Use try_send() to stay non-blocking (fire-and-forget), matching
+            // the semantics of ActorRef::send().
+            let _ = actor_ref.tell(msg).try_send();
         });
         KameoTimerHandle {
             handle: Some(handle),
