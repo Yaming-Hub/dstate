@@ -49,7 +49,7 @@ impl DistributedState for Counter {
     }
 
     fn deserialize_state(bytes: &[u8], _version: u32) -> Result<Self, DeserializeError> {
-        bincode::deserialize(bytes).map_err(|e| DeserializeError::malformed(e.to_string()))
+        bincode::deserialize(bytes).map_err(|e| DeserializeError::Malformed(e.to_string()))
     }
 }
 ```
