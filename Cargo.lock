@@ -172,8 +172,10 @@ dependencies = [
 name = "dstate-kameo"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "dstate",
  "kameo",
+ "serde",
  "tokio",
 ]
 
@@ -181,8 +183,10 @@ dependencies = [
 name = "dstate-ractor"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "dstate",
  "ractor",
+ "serde",
  "tokio",
 ]
 

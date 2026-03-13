@@ -1,3 +1,26 @@
+//! # dstate
+//!
+//! Framework-agnostic distributed state replication for Rust actor systems.
+//!
+//! `dstate` provides traits and replication logic for managing state that is
+//! replicated across nodes in a cluster. State changes are projected into
+//! public views, synchronized via configurable strategies, and persisted
+//! through a pluggable storage interface.
+//!
+//! ## Core Traits
+//!
+//! - [`DistributedState`] — Simple state where the entire value is the public view
+//! - [`DeltaDistributedState`] — State with separate view/delta projections
+//! - [`ActorRuntime`] — Actor spawning, timers, and processing groups
+//! - [`StatePersistence`] — Async save/load for crash recovery
+//! - [`Clock`] — Time abstraction for deterministic testing
+//!
+//! ## Adapter Crates
+//!
+//! Use `dstate` with a concrete actor framework via an adapter:
+//! - [`dstate-ractor`](https://crates.io/crates/dstate-ractor) — ractor adapter
+//! - [`dstate-kameo`](https://crates.io/crates/dstate-kameo) — kameo adapter
+
 // ── Traits (what users implement) ────────────────────────────────
 pub use traits::state::{DeltaDistributedState, DistributedState, SyncUrgency};
 pub use traits::runtime::{

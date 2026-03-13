@@ -32,8 +32,11 @@ pub enum SyncMessage {
 /// A notification that a state has changed on a node (used by the change feed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeNotification {
+    /// Name of the state type that changed.
     pub state_name: String,
+    /// Node that originated the change.
     pub source_node: NodeId,
+    /// Generation of the state after the change.
     pub generation: Generation,
 }
 
@@ -41,6 +44,8 @@ pub struct ChangeNotification {
 /// No target node is specified because this message is broadcast to all nodes in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchedChangeFeed {
+    /// Node that aggregated and broadcast this batch.
     pub source_node: NodeId,
+    /// Individual change notifications in this batch.
     pub notifications: Vec<ChangeNotification>,
 }
