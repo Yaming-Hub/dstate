@@ -1,0 +1,15 @@
+[package]
+name = "dstate-integration"
+version = "0.1.0"
+edition = "2021"
+description = "Integration tests for the dstate distributed state crate"
+license = "MIT"
+publish = false
+
+[dependencies]
+dstate = { path = "../dstate" }
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
