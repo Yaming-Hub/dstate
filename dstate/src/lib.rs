@@ -44,6 +44,13 @@ pub use types::sync_message::{BatchedChangeFeed, ChangeNotification, SyncMessage
 // ── Registry (state registration and lookup) ────────────────────
 pub use registry::{AnyStateShard, StateRegistry};
 
+// ── Engine (public API for driving the replication protocol) ─────
+pub mod engine;
+pub use engine::{
+    DistributedStateEngine, EngineAction, EngineHealth, EngineQueryResult, HealthStatus,
+    MutateResult, DeltaMutateResult, SyncMetrics, WireMessage,
+};
+
 // ── Test support (public for adapter crates and downstream tests) ─
 pub mod test_support;
 
