@@ -315,6 +315,12 @@ where
     ///
     /// Returns actions the host must execute (e.g., sending a snapshot
     /// in response to a `RequestSnapshot`).
+    ///
+    /// **Note on unknown peers:** The engine accepts inbound snapshots even
+    /// from peers that have not been announced via [`on_node_joined`]. This
+    /// allows late-arriving snapshots to populate the view map. If stricter
+    /// membership control is desired, the caller should gate inbound messages
+    /// before calling this method.
     pub fn handle_inbound_sync(&mut self, msg: SyncMessage) -> Vec<EngineAction> {
         match msg {
             SyncMessage::FullSnapshot {
@@ -337,6 +343,21 @@ where
                 state_name,
                 requester,
             } => self.handle_request_snapshot(state_name, requester),
+        }
+    }
+
+    /// Process an inbound wire message (convenience wrapper).
+    ///
+    /// Dispatches to [`handle_inbound_sync`](Self::handle_inbound_sync) or
+    /// [`handle_inbound_change_feed`](Self::handle_inbound_change_feed)
+    /// depending on the message variant.
+    pub fn handle_inbound(&mut self, msg: WireMessage) -> Vec<EngineAction> {
+        match msg {
+            WireMessage::Sync(sync_msg) => self.handle_inbound_sync(sync_msg),
+            WireMessage::Feed(feed) => {
+                self.handle_inbound_change_feed(feed);
+                vec![]
+            }
         }
     }
 
@@ -603,6 +624,7 @@ where
             }
             SyncAction::ScheduleDelayed(delay) => {
                 let data = (self.serialize_view)(view);
+                self.diagnostics.record_snapshot_sent();
                 vec![EngineAction::ScheduleDelayed {
                     delay: *delay,
                     message: SyncMessage::FullSnapshot {
@@ -663,6 +685,7 @@ where
             }
             SyncAction::ScheduleDelayed(delay) => {
                 let data = serialize_delta(view_delta);
+                self.diagnostics.record_delta_sent();
                 vec![EngineAction::ScheduleDelayed {
                     delay: *delay,
                     message: SyncMessage::DeltaUpdate {
@@ -708,6 +731,8 @@ where
                             reason,
                             self.shard.clock(),
                         );
+                        // Remove the peer's view so stale data is not visible.
+                        self.shard.on_node_left(source_node);
                     }
                     VersionMismatchAction::KeepStale { reason, .. } => {
                         self.diagnostics.record_sync_failure(
@@ -715,6 +740,7 @@ where
                             reason,
                             self.shard.clock(),
                         );
+                        // Keep existing view; log only.
                     }
                 }
                 return vec![];
@@ -745,6 +771,9 @@ where
                     .record_snapshot_received(source_node, 0, self.shard.clock());
             }
             AcceptResult::Discarded => {
+                // Stale snapshot (our view is already newer).
+                // Note: record_stale_delta_discarded covers both stale snapshots
+                // and deltas; rename in a future metrics refactor if needed.
                 self.diagnostics.record_stale_delta_discarded();
             }
         }
@@ -767,6 +796,21 @@ where
             return vec![];
         }
 
+        // Check wire version compatibility before attempting deserialization.
+        if wire_version != self.wire_version {
+            let action = self.versioning.on_deserialize_error(wire_version);
+            let reason = match &action {
+                VersionMismatchAction::DropView { reason, .. } => {
+                    self.shard.on_node_left(source_node);
+                    reason.clone()
+                }
+                VersionMismatchAction::KeepStale { reason, .. } => reason.clone(),
+            };
+            self.diagnostics
+                .record_sync_failure(source_node, &reason, self.shard.clock());
+            return vec![];
+        }
+
         let delta_applier = match &self.inbound_delta_applier {
             Some(applier) => applier,
             None => return vec![self.make_snapshot_request(source_node)],
@@ -778,15 +822,35 @@ where
             None => return vec![self.make_snapshot_request(source_node)],
         };
 
+        // Pre-check generation before calling the delta applier to avoid
+        // applying a delta to a wrong base view. The delta must advance
+        // age by exactly 1 within the same incarnation.
+        if generation.incarnation != current_view.generation.incarnation
+            || generation.age != current_view.generation.age + 1
+        {
+            if generation <= current_view.generation {
+                self.diagnostics.record_stale_delta_discarded();
+                return vec![];
+            }
+            // Gap detected: need a full snapshot to catch up.
+            self.diagnostics.record_gap_detected(source_node);
+            return vec![self.make_snapshot_request(source_node)];
+        }
+
         // Apply the delta to produce the new view.
         let new_view = match delta_applier(&data, wire_version, &current_view.value) {
             Ok(v) => v,
-            Err(_) => {
-                self.diagnostics.record_sync_failure(
-                    source_node,
-                    "delta deserialization failed",
-                    self.shard.clock(),
-                );
+            Err(e) => {
+                let reason = match &e {
+                    DeserializeError::UnknownVersion(v) => {
+                        format!("delta version mismatch: {v}")
+                    }
+                    DeserializeError::Malformed(msg) => {
+                        format!("delta malformed: {msg}")
+                    }
+                };
+                self.diagnostics
+                    .record_sync_failure(source_node, &reason, self.shard.clock());
                 return vec![self.make_snapshot_request(source_node)];
             }
         };
