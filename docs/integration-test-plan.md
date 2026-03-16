@@ -58,9 +58,11 @@ Implements `dstate::ActorRuntime` with:
 
 - **Single-threaded mailbox**: Each actor has a `VecDeque<M>` processed by
   explicit `drain()` / `tick()` calls. No background threads — fully
-  deterministic.
-- **Processing groups**: Local type-erased registry (same pattern as ractor/kameo
-  adapters).
+  deterministic. Although execution is single-threaded, the `ActorRuntime`
+  trait requires `Send + Sync` bounds, so internals use `Arc<Mutex<...>>`
+  for type-system compliance.
+- **Processing groups**: Local type-erased registry keyed by
+  `(group_name, TypeId)` (same pattern as ractor/kameo adapters).
 - **Timers**: Driven by `TestClock`. `send_interval` and `send_after` are
   evaluated on each `tick()` by comparing scheduled time against the clock.
 - **Cluster events**: Callback-based subscription with snapshot pattern.
@@ -69,10 +71,20 @@ Implements `dstate::ActorRuntime` with:
 
 Routes messages between `MockNode` instances:
 
-- **Byte-level boundary**: All `SyncMessage` and `BatchedChangeFeed` values
-  are serialized to `Vec<u8>` (via bincode) before crossing node boundaries
-  and deserialized on the receiving end. This enforces that all wire types
-  survive serialization round-trips.
+- **Wire envelope**: All inter-node messages are wrapped in a `WireMessage`
+  enum before serialization:
+  ```rust
+  #[derive(Serialize, Deserialize)]
+  pub enum WireMessage {
+      Sync(SyncMessage),
+      Feed(BatchedChangeFeed),
+  }
+  ```
+  This ensures the receiver can safely deserialize without guessing the type.
+- **Byte-level boundary**: `WireMessage` values are serialized to `Vec<u8>`
+  (via bincode) before crossing node boundaries and deserialized on the
+  receiving end. This enforces that all wire types survive serialization
+  round-trips (both envelope and state payload).
 - **Interceptor pipeline**: Messages pass through a chain of
   `NetworkInterceptor` implementations before delivery. Each interceptor
   can inspect, modify, delay, or drop messages.
@@ -83,15 +95,34 @@ Routes messages between `MockNode` instances:
 ### NetworkInterceptor
 
 ```rust
+/// Decision returned by a network interceptor.
+pub enum InterceptAction {
+    /// Deliver the message (possibly modified) immediately.
+    Deliver(Vec<u8>),
+    /// Drop the message silently.
+    Drop,
+    /// Hold the message for `n` ticks before delivery.
+    Delay { bytes: Vec<u8>, ticks: usize },
+    /// Deliver multiple copies (for duplication testing).
+    DeliverMany(Vec<Vec<u8>>),
+}
+
 pub trait NetworkInterceptor: Send {
-    /// Inspect a message in transit. Return `Some(bytes)` to deliver
-    /// (possibly modified), or `None` to drop.
+    /// Inspect a message in transit. Return an action controlling delivery.
     fn intercept(
         &mut self,
         from: NodeId,
         to: NodeId,
         msg_bytes: &[u8],
-    ) -> Option<Vec<u8>>;
+        context: &InterceptContext,
+    ) -> InterceptAction;
+}
+
+/// Context passed to interceptors for deterministic decisions.
+pub struct InterceptContext {
+    pub current_tick: u64,
+    pub message_id: u64,
+    pub rng_seed: u64,
 }
 ```
 
@@ -101,11 +132,12 @@ Built-in interceptors:
 |-------------|----------|
 | `PassThrough` | Deliver all messages unmodified |
 | `DropAll` | Drop all messages (total network failure) |
-| `DropRate(f64)` | Drop messages with given probability |
-| `Partition(A, B)` | Drop messages between node sets A and B |
-| `CorruptBytes` | Flip random bits in serialized data |
+| `DropRate(f64, seed)` | Drop messages with given probability (deterministic seeded RNG) |
+| `Partition(A, B)` | Drop messages between node sets A and B (supports asymmetric) |
+| `CorruptBytes(seed)` | Flip random bits in serialized data (deterministic seeded RNG) |
 | `DelayTicks(n)` | Hold messages for n `tick()` calls before delivery |
 | `DuplicateAll` | Deliver each message twice |
+| `Reorder(seed)` | Shuffle delivery order within a tick window (deterministic) |
 
 ### MockCluster
 
@@ -150,8 +182,8 @@ impl MockCluster {
 
 ### DistributedStateEngine
 
-A new public type in the `dstate` crate (gated behind a feature flag or
-always public) that wraps all core logic modules:
+A new public type in the `dstate` crate that wraps all core logic modules
+for a single state type:
 
 ```rust
 pub struct DistributedStateEngine<S, V> {
@@ -162,6 +194,27 @@ pub struct DistributedStateEngine<S, V> {
     lifecycle: LifecycleLogic,
     diagnostics: DiagnosticsLogic,
     persistence_startup: PersistenceStartupLogic,
+    clock: Arc<dyn Clock>,
+}
+```
+
+**Per-state, not per-node**: Each engine manages one state type. For
+multi-state scenarios (INT-10), a `MockNode` holds a `StateRegistry` of
+multiple engines and routes inbound `WireMessage` by `state_name`.
+
+**Clock injection**: The engine accepts `Arc<dyn Clock>` at construction,
+ensuring `TestClock` is the single source of truth for `Generation`
+incarnation values and timer evaluation. No `SystemTime::now()` calls.
+
+**Action-based API**: Mutation and inbound methods return explicit outbound
+actions rather than sending implicitly, so `MockTransport` can capture
+and route them:
+
+```rust
+pub enum EngineAction {
+    SendToAll(WireMessage),
+    SendTo(NodeId, WireMessage),
+    ScheduleDelayed(Duration, WireMessage),
 }
 ```
 
@@ -169,15 +222,19 @@ This engine is the "missing link" between the pure logic modules and the
 actor framework. It provides a single entry point for:
 
 - **Mutations**: `mutate()` → applies mutation, determines sync action,
-  returns outbound messages to send.
+  returns `Vec<EngineAction>` for outbound messages.
 - **Inbound sync**: `handle_inbound_sync(SyncMessage)` → processes
-  snapshot/delta, updates views.
+  snapshot/delta, updates views, returns response actions.
 - **Inbound change feed**: `handle_inbound_change_feed(BatchedChangeFeed)`
   → marks stale peers.
+- **Change feed flush**: `flush_change_feed()` → returns batched
+  notifications if any pending (driven by `MockCluster.tick()`).
 - **Cluster events**: `on_node_joined()` / `on_node_left()` → updates
   views, returns actions (e.g., send snapshot to new peer).
 - **Queries**: `query()` → reads from view map with freshness checking.
 - **Diagnostics**: `metrics()` / `health_status()` → sync health info.
+- **Tick**: `tick(elapsed: Duration)` → advances internal timers
+  (periodic sync, delayed sends), returns any triggered actions.
 
 This type is useful beyond integration testing — it's the natural public
 API for embedding dstate in any application.
@@ -232,8 +289,8 @@ support. sync_urgency returns `Immediate` for large memory changes.
 |----|----------|-------|-----------|
 | FAULT-01 | Network partition (2+1 split) | Partition({0,1}, {2}) | Isolated node accumulates stale views; healing restores consistency |
 | FAULT-02 | Total network failure | DropAll | Mutations succeed locally; sync resumes on recovery |
-| FAULT-03 | Random packet loss (30%) | DropRate(0.3) | Eventually consistent despite losses (periodic sync heals) |
-| FAULT-04 | Byte corruption in transit | CorruptBytes | DeserializeError handled per VersionMismatchPolicy |
+| FAULT-03 | Random packet loss (30%) | DropRate(0.3, seed) | Eventually consistent despite losses (periodic sync heals) |
+| FAULT-04 | Byte corruption in transit | CorruptBytes(seed) | DeserializeError handled per VersionMismatchPolicy |
 | FAULT-05 | Node crash + restart | Stop + rejoin | Incarnation bumps; fresh snapshots exchanged |
 | FAULT-06 | Persistence failure on save | FailingPersistence | MutationError propagated to caller |
 | FAULT-07 | Persistence failure on load (startup) | FailingPersistence | FallbackToEmpty with new incarnation |
@@ -244,6 +301,39 @@ support. sync_urgency returns `Immediate` for large memory changes.
 | FAULT-12 | Delta gap detection | Skip ages (1→5) | GapDetected → full snapshot pull triggered |
 | FAULT-13 | Single-node cluster | 1 node, no peers | Mutations succeed; queries return own view; no sync errors |
 | FAULT-14 | Empty cluster bootstrap | 0→3 nodes | Nodes join sequentially; all converge on initial state |
+| FAULT-15 | Asymmetric partition (one-way) | A→B dropped, B→A ok | One-way visibility; healing restores |
+| FAULT-16 | Out-of-order delta delivery | Reorder(seed) | DeltaUpdate(age=5) before age=4 → GapDetected → pull |
+| FAULT-17 | Duplicate + stale delivery | DuplicateAll + DelayTicks | Duplicate arrives after newer update; idempotent |
+| FAULT-18 | Unknown state_name in SyncMessage | Manual injection | Ignored without panic; metrics/logging |
+| FAULT-19 | RequestSnapshot storm under partition | Partition + stale queries | Bounded outbound requests; no explosion |
+| FAULT-20 | Version mismatch recovery | V1→V2 upgrade mid-test | View recovers after compatible version arrives |
+| FAULT-21 | Join/leave race with in-flight snapshot | Leave during snapshot send | No panic; no ghost re-add |
+| FAULT-22 | Large payload (1MB+ snapshot) | None | Serialization handles large buffers correctly |
+
+## Determinism Guidelines
+
+To ensure fully deterministic, repeatable test execution:
+
+1. **Clock**: All time comes from `TestClock` — no `SystemTime::now()` or
+   `Instant::now()` anywhere in the test path. `DistributedStateEngine`
+   accepts `Arc<dyn Clock>` for `Generation` incarnation values.
+
+2. **HashMap ordering**: Tests must not assert on iteration order of
+   `HashMap`-based collections (e.g., `ChangeFeedLogic` notifications).
+   Sort results before comparison, or use `BTreeMap` in test paths.
+
+3. **Seeded RNG**: All probabilistic interceptors (`DropRate`, `CorruptBytes`,
+   `Reorder`) accept an explicit seed. Tests use fixed seeds for
+   reproducibility.
+
+4. **Tick phase ordering**: Each `tick()` executes phases in strict order:
+   1. Deliver transport queue messages due at this tick
+   2. Run all actor mailboxes to quiescence (process in `NodeId` order)
+   3. Evaluate timer events due at/before current clock time
+   4. Advance `TestClock` by tick duration
+
+5. **Node processing order**: When multiple nodes are processed in a single
+   tick, they are always processed in ascending `NodeId` order.
 
 ## Implementation Schedule
 
@@ -273,6 +363,8 @@ support. sync_urgency returns `Immediate` for large memory changes.
 - Test state fixtures: `SimpleCounter`, `ResourceMetrics`
 
 ### PR 5 — Fault Injection + Edge Case Tests
-- FAULT-01 through FAULT-14
+- FAULT-01 through FAULT-22
 - Stress tests with high mutation rates
 - Partition healing and recovery scenarios
+- Out-of-order delivery and duplication
+- Large payload handling
