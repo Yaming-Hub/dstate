@@ -365,12 +365,17 @@ where
     ///
     /// Marks peer views as stale based on feed notifications. Stale views
     /// will trigger snapshot requests on the next query (if `pull_on_query`
-    /// is enabled).
+    /// is enabled). Notifications from departed nodes are ignored.
     pub fn handle_inbound_change_feed(&mut self, feed: BatchedChangeFeed) {
         let entries =
             ChangeFeedLogic::route_inbound_batch(&feed, self.shard.node_id());
         for (sn, source, gen) in entries {
             if sn != self.state_name {
+                continue;
+            }
+            // Ignore notifications from departed nodes to prevent stale
+            // flags that would trigger pull requests to banned peers.
+            if !self.lifecycle.should_accept_from(&source) {
                 continue;
             }
             self.shard.mark_stale(source, gen.incarnation, gen.age);
@@ -441,7 +446,8 @@ where
     /// Query the current view of all peers.
     ///
     /// If `pull_on_query` is enabled and stale peers are detected, the
-    /// engine issues `RequestSnapshot` actions for those peers.
+    /// engine issues `RequestSnapshot` actions for those peers (excluding
+    /// departed nodes).
     pub fn query<R>(
         &self,
         max_staleness: Duration,
@@ -459,6 +465,7 @@ where
                 let actions = if self.sync_logic.strategy().pull_on_query {
                     stale_peers
                         .iter()
+                        .filter(|peer| self.lifecycle.should_accept_from(peer))
                         .map(|&peer| EngineAction::SendSync {
                             target: peer,
                             message: SyncMessage::RequestSnapshot {
@@ -887,6 +894,10 @@ where
         requester: NodeId,
     ) -> Vec<EngineAction> {
         if state_name != self.state_name {
+            return vec![];
+        }
+        // Don't respond to departed/unauthorized nodes.
+        if !self.lifecycle.should_accept_from(&requester) {
             return vec![];
         }
 
@@ -1641,5 +1652,197 @@ mod tests {
         // Verify engine 2 applied the delta
         let view = engine2.get_view(&NodeId(1)).unwrap();
         assert_eq!(view.value.counter, 13); // 10 + 3
+    }
+
+    // ── Lifecycle gating tests (from v2 reviews) ────────────────
+
+    #[test]
+    fn request_snapshot_rejected_from_departed_node() {
+        let clock = test_clock();
+        let mut engine = make_engine(NodeId(1), clock);
+
+        // Add and remove node 2
+        engine.on_node_joined(NodeId(2), TestState::default());
+        engine.on_node_left(NodeId(2));
+
+        // Departed node requests a snapshot — should be silently ignored
+        let actions = engine.handle_inbound_sync(SyncMessage::RequestSnapshot {
+            state_name: "test_state".into(),
+            requester: NodeId(2),
+        });
+        assert!(actions.is_empty());
+        // Snapshot should NOT have been sent (metric stays at 1 from on_node_joined)
+        assert_eq!(engine.metrics().snapshots_sent, 1);
+    }
+
+    #[test]
+    fn change_feed_from_departed_node_ignored() {
+        let clock = test_clock();
+        let mut engine = make_feed_engine(NodeId(1), clock.clone());
+
+        // Add peer, accept initial snapshot, then remove
+        engine.on_node_joined(NodeId(2), TestState::default());
+        let data = bincode::serialize(&TestState { counter: 1, label: "x".into() }).unwrap();
+        engine.handle_inbound_sync(SyncMessage::FullSnapshot {
+            state_name: "test_state".into(),
+            source_node: NodeId(2),
+            generation: Generation::new(1_000_000, 1),
+            wire_version: 1,
+            data,
+        });
+        engine.on_node_left(NodeId(2));
+
+        // Receive change feed from departed node — should be ignored
+        let feed = BatchedChangeFeed {
+            source_node: NodeId(2),
+            notifications: vec![crate::types::sync_message::ChangeNotification {
+                state_name: "test_state".into(),
+                source_node: NodeId(2),
+                generation: Generation::new(1_000_000, 10),
+            }],
+        };
+        engine.handle_inbound_change_feed(feed);
+
+        // Query should not try to pull from departed node 2
+        clock.advance(Duration::from_secs(60));
+        let (_result, actions) = engine.query(Duration::from_millis(1), |_| ());
+        // No RequestSnapshot to departed node
+        let requests_to_node2: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, EngineAction::SendSync { target: NodeId(2), .. }))
+            .collect();
+        assert!(requests_to_node2.is_empty());
+    }
+
+    #[test]
+    fn query_pull_skips_departed_peers() {
+        let clock = test_clock();
+        let mut engine = make_feed_engine(NodeId(1), clock.clone());
+
+        // Add two peers
+        engine.on_node_joined(NodeId(2), TestState::default());
+        engine.on_node_joined(NodeId(3), TestState::default());
+
+        // Accept snapshots from both
+        for &id in &[2u64, 3] {
+            let data = bincode::serialize(&TestState { counter: id, label: format!("n{id}") }).unwrap();
+            engine.handle_inbound_sync(SyncMessage::FullSnapshot {
+                state_name: "test_state".into(),
+                source_node: NodeId(id),
+                generation: Generation::new(1_000_000, 1),
+                wire_version: 1,
+                data,
+            });
+        }
+
+        // Depart node 2
+        engine.on_node_left(NodeId(2));
+
+        // Make node 3 stale
+        let feed = BatchedChangeFeed {
+            source_node: NodeId(3),
+            notifications: vec![crate::types::sync_message::ChangeNotification {
+                state_name: "test_state".into(),
+                source_node: NodeId(3),
+                generation: Generation::new(1_000_000, 5),
+            }],
+        };
+        engine.handle_inbound_change_feed(feed);
+
+        // Query — should only pull from node 3, not departed node 2
+        clock.advance(Duration::from_secs(60));
+        let (_result, actions) = engine.query(Duration::from_millis(1), |_| ());
+
+        let targets: Vec<NodeId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                EngineAction::SendSync { target, .. } => Some(*target),
+                _ => None,
+            })
+            .collect();
+        assert!(targets.contains(&NodeId(3)));
+        assert!(!targets.contains(&NodeId(2)));
+    }
+
+    #[test]
+    fn inbound_delta_stale_discarded() {
+        let clock = test_clock();
+        let mut engine = make_delta_engine(NodeId(1), clock);
+
+        engine.on_node_joined(NodeId(2), TestDeltaView { counter: 0, label: String::new() });
+        // Accept snapshot at age=5
+        let view = TestDeltaView { counter: 50, label: "peer".into() };
+        engine.handle_inbound_sync(SyncMessage::FullSnapshot {
+            state_name: "test_delta_state".into(),
+            source_node: NodeId(2),
+            generation: Generation::new(1_000_000, 5),
+            wire_version: 1,
+            data: TestDeltaState::serialize_view(&view),
+        });
+
+        // Send delta at age=3 (stale — older than current age=5)
+        let delta = TestDeltaViewDelta { counter_delta: 1, new_label: None };
+        let actions = engine.handle_inbound_sync(SyncMessage::DeltaUpdate {
+            state_name: "test_delta_state".into(),
+            source_node: NodeId(2),
+            generation: Generation::new(1_000_000, 3),
+            wire_version: 1,
+            data: TestDeltaState::serialize_delta(&delta),
+        });
+
+        // Stale delta should be silently discarded (no snapshot request)
+        assert!(actions.is_empty());
+        assert_eq!(engine.metrics().stale_deltas_discarded, 1);
+        // View should be unchanged
+        let v = engine.get_view(&NodeId(2)).unwrap();
+        assert_eq!(v.value.counter, 50);
+    }
+
+    #[test]
+    fn inbound_delta_wrong_wire_version_rejected() {
+        let clock = test_clock();
+        let mut engine = make_delta_engine(NodeId(1), clock);
+
+        engine.on_node_joined(NodeId(2), TestDeltaView { counter: 0, label: String::new() });
+        let view = TestDeltaView { counter: 10, label: "p".into() };
+        engine.handle_inbound_sync(SyncMessage::FullSnapshot {
+            state_name: "test_delta_state".into(),
+            source_node: NodeId(2),
+            generation: Generation::new(1_000_000, 1),
+            wire_version: 1,
+            data: TestDeltaState::serialize_view(&view),
+        });
+
+        // Send delta with wrong wire version
+        let actions = engine.handle_inbound_sync(SyncMessage::DeltaUpdate {
+            state_name: "test_delta_state".into(),
+            source_node: NodeId(2),
+            generation: Generation::new(1_000_000, 2),
+            wire_version: 99,
+            data: vec![1, 2, 3],
+        });
+
+        assert!(actions.is_empty()); // version mismatch → no request
+        assert_eq!(engine.metrics().sync_failures, 1);
+    }
+
+    #[test]
+    fn handle_inbound_wire_message_dispatches() {
+        let clock = test_clock();
+        let mut engine = make_engine(NodeId(1), clock);
+
+        // Test WireMessage::Sync dispatch
+        let actions = engine.handle_inbound(WireMessage::Sync(SyncMessage::RequestSnapshot {
+            state_name: "test_state".into(),
+            requester: NodeId(2),
+        }));
+        assert_eq!(actions.len(), 1);
+
+        // Test WireMessage::Feed dispatch
+        let actions = engine.handle_inbound(WireMessage::Feed(BatchedChangeFeed {
+            source_node: NodeId(2),
+            notifications: vec![],
+        }));
+        assert!(actions.is_empty());
     }
 }
