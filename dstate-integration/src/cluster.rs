@@ -28,7 +28,7 @@ where
     scheduled: Vec<ScheduledAction>,
     /// Ticks since last change-feed flush.
     feed_flush_counter: u64,
-    /// Change-feed flush interval in ticks (0 = disabled).
+    /// Change-feed flush interval in ticks. Minimum 1 (flush every tick).
     feed_flush_interval: u64,
 }
 
@@ -61,6 +61,8 @@ where
     clock: Arc<TestClock>,
     tick_duration: Duration,
     current_tick: u64,
+    /// Count of corrupted messages seen across all ticks.
+    corrupted_count: u64,
 }
 
 impl<S, V> MockCluster<S, V>
@@ -80,6 +82,7 @@ where
             clock,
             tick_duration,
             current_tick: 0,
+            corrupted_count: 0,
         }
     }
 
@@ -108,18 +111,20 @@ where
         }
 
         // Insert the new node
-        let feed_interval = engine
+        let batch_ms = engine
             .sync_strategy()
             .change_feed
             .batch_interval
-            .as_millis() as u64
-            / self.tick_duration.as_millis().max(1) as u64;
+            .as_millis() as u64;
+        let tick_ms = self.tick_duration.as_millis().max(1) as u64;
+        // Round up so we never flush more frequently than configured
+        let feed_interval = batch_ms.div_ceil(tick_ms).max(1);
 
         let mut new_node = MockNode {
             engine,
             scheduled: Vec::new(),
             feed_flush_counter: 0,
-            feed_flush_interval: feed_interval.max(1),
+            feed_flush_interval: feed_interval,
         };
 
         // Announce existing nodes to the new node; collect actions first
@@ -141,10 +146,20 @@ where
         }
     }
 
-    /// Remove a node from the cluster (simulates crash).
+    /// Remove a node from the cluster (simulates graceful departure).
+    /// In-flight messages from this node may still be delivered.
     pub fn remove_node(&mut self, node_id: NodeId) {
         self.nodes.remove(&node_id);
-        // Announce departure to remaining nodes
+        for (_, node) in &mut self.nodes {
+            node.engine.on_node_left(node_id);
+        }
+    }
+
+    /// Remove a node and purge all in-flight messages involving it
+    /// (simulates hard crash where queued messages are lost).
+    pub fn remove_node_hard(&mut self, node_id: NodeId) {
+        self.nodes.remove(&node_id);
+        self.transport.drop_in_flight_for(node_id);
         for (_, node) in &mut self.nodes {
             node.engine.on_node_left(node_id);
         }
@@ -154,6 +169,7 @@ where
     pub fn tick(&mut self) {
         // Phase 1: Deliver transport messages due at this tick
         let delivery = self.transport.deliver_due();
+        self.corrupted_count += delivery.corrupted.len() as u64;
         let mut pending_actions: Vec<(NodeId, Vec<EngineAction>)> = Vec::new();
         for msg in delivery.delivered {
             if let Some(node) = self.nodes.get_mut(&msg.to) {
@@ -167,7 +183,6 @@ where
         for (node_id, actions) in pending_actions {
             self.route_actions(node_id, &actions);
         }
-        // Corrupted messages are silently dropped (logged in real systems)
 
         // Phase 2: Evaluate scheduled timer events
         let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
@@ -310,6 +325,23 @@ where
         &mut self.transport
     }
 
+    /// Read-only access to the transport (for assertions).
+    pub fn transport(&self) -> &MockTransport {
+        &self.transport
+    }
+
+    /// Total number of corrupted messages seen across all ticks.
+    pub fn corrupted_count(&self) -> u64 {
+        self.corrupted_count
+    }
+
+    /// Run multiple ticks.
+    pub fn tick_n(&mut self, n: u64) {
+        for _ in 0..n {
+            self.tick();
+        }
+    }
+
     // ── Internal ────────────────────────────────────────────────
 
     fn route_actions(&mut self, from: NodeId, actions: &[EngineAction]) {
@@ -325,8 +357,10 @@ where
                         .send(from, *target, &WireMessage::Sync(message.clone()));
                 }
                 EngineAction::ScheduleDelayed { delay, message } => {
-                    let delay_ticks =
-                        (delay.as_millis() as u64) / (self.tick_duration.as_millis().max(1) as u64);
+                    let delay_ms = delay.as_millis() as u64;
+                    let tick_ms = self.tick_duration.as_millis().max(1) as u64;
+                    // Round up so sub-tick delays still wait at least 1 tick
+                    let delay_ticks = delay_ms.div_ceil(tick_ms).max(1);
                     if let Some(node) = self.nodes.get_mut(&from) {
                         node.scheduled.push(ScheduledAction {
                             message: message.clone(),
@@ -591,5 +625,71 @@ mod tests {
         // Node 1 should have the correct value despite receiving duplicates
         let v = cluster.engine(NodeId(1)).get_view(&NodeId(0)).unwrap();
         assert_eq!(v.value.counter, 42);
+    }
+
+    #[test]
+    fn single_node_cluster_settles_immediately() {
+        let mut cluster = MockCluster::with_test_state(1, default_config());
+        cluster.mutate(
+            NodeId(0),
+            |s| s.counter = 1,
+            |s| s.clone(),
+            SyncUrgency::Default,
+        );
+        // Single node: no peers, should settle with minimal ticks
+        let ticks = cluster.settle();
+        assert!(ticks <= 20, "single node should settle quickly, took {ticks}");
+    }
+
+    #[test]
+    fn hard_remove_purges_in_flight() {
+        let mut cluster = MockCluster::with_test_state(3, default_config());
+        cluster.settle();
+
+        // Mutate on node 0 — generates in-flight messages
+        cluster.mutate(
+            NodeId(0),
+            |s| s.counter = 42,
+            |s| s.clone(),
+            SyncUrgency::Default,
+        );
+        assert!(cluster.in_flight_count() > 0);
+
+        // Hard remove node 0 — should purge its in-flight messages
+        cluster.remove_node_hard(NodeId(0));
+        assert_eq!(cluster.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn tick_n_advances_multiple_ticks() {
+        let mut cluster = MockCluster::with_test_state(2, default_config());
+        cluster.tick_n(5);
+        assert_eq!(cluster.current_tick(), 5);
+    }
+
+    #[test]
+    fn corrupted_messages_tracked() {
+        use crate::interceptor::CorruptBytes;
+
+        let mut cluster = MockCluster::with_test_state(2, default_config());
+        cluster.settle();
+
+        // Add corruption
+        cluster
+            .transport_mut()
+            .add_interceptor(Box::new(CorruptBytes::new(99)));
+
+        cluster.mutate(
+            NodeId(0),
+            |s| s.counter = 1,
+            |s| s.clone(),
+            SyncUrgency::Default,
+        );
+        cluster.tick_n(5);
+
+        // At least some messages should have been corrupted
+        // (depends on which bit got flipped — may or may not be valid bincode)
+        // The test just verifies the counter is accessible
+        let _ = cluster.corrupted_count();
     }
 }

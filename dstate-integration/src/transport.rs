@@ -151,6 +151,13 @@ impl MockTransport {
         self.interceptors.clear();
     }
 
+    /// Drop all in-flight messages involving a specific node (from or to).
+    /// Used to simulate a hard crash where queued messages are lost.
+    pub fn drop_in_flight_for(&mut self, node_id: NodeId) {
+        self.in_flight
+            .retain(|m| m.from != node_id && m.to != node_id);
+    }
+
     // ── Internal ────────────────────────────────────────────────
 
     fn send_bytes(&mut self, from: NodeId, to: NodeId, bytes: Vec<u8>) {
@@ -180,11 +187,12 @@ impl MockTransport {
                     // Message silently dropped
                 }
                 InterceptAction::Delay { bytes: data, ticks } => {
+                    // Delay is additive to the baseline 1-tick latency
                     self.in_flight.push_back(InFlightMessage {
                         from,
                         to,
                         data,
-                        deliver_at_tick: self.current_tick + ticks as u64,
+                        deliver_at_tick: self.current_tick + 1 + ticks as u64,
                     });
                 }
                 InterceptAction::DeliverMany(copies) => {
@@ -202,6 +210,10 @@ impl MockTransport {
     }
 
     /// Apply all interceptors in sequence. Returns the final list of actions.
+    ///
+    /// Each interceptor sees every pending message and decides what to do.
+    /// `Delay` actions finalize the message (skip further interceptors for
+    /// that message) but do NOT drop other pending messages.
     fn apply_interceptors(
         &mut self,
         from: NodeId,
@@ -215,6 +227,8 @@ impl MockTransport {
 
         // Start with the original message
         let mut pending = vec![bytes.to_vec()];
+        // Finalized actions (e.g., delayed messages that skip further interceptors)
+        let mut finalized: Vec<InterceptAction> = Vec::new();
 
         for interceptor in &mut self.interceptors {
             let mut next_pending = Vec::new();
@@ -227,10 +241,8 @@ impl MockTransport {
                         // Message dropped by this interceptor
                     }
                     InterceptAction::Delay { bytes: data, ticks } => {
-                        // For chained interceptors, convert delay to a deliver
-                        // action that the caller will handle. We return the
-                        // delay as a final action.
-                        return vec![InterceptAction::Delay { bytes: data, ticks }];
+                        // Finalize: skip further interceptors for this message
+                        finalized.push(InterceptAction::Delay { bytes: data, ticks });
                     }
                     InterceptAction::DeliverMany(copies) => {
                         next_pending.extend(copies);
@@ -241,10 +253,8 @@ impl MockTransport {
         }
 
         // Convert remaining pending bytes into Deliver actions
-        pending
-            .into_iter()
-            .map(InterceptAction::Deliver)
-            .collect()
+        finalized.extend(pending.into_iter().map(InterceptAction::Deliver));
+        finalized
     }
 }
 
@@ -309,13 +319,14 @@ mod tests {
         transport.add_interceptor(Box::new(DelayTicks(3)));
         transport.send(NodeId(1), NodeId(2), &test_msg());
 
-        // Should not be delivered for 3 ticks
-        for _ in 0..2 {
+        // Baseline 1 tick + 3 extra = deliver at tick 4
+        // Not delivered for ticks 1..3
+        for _ in 0..3 {
             transport.advance_tick();
             assert!(transport.deliver_due().delivered.is_empty());
         }
 
-        // Delivered on tick 3
+        // Delivered on tick 4
         transport.advance_tick();
         let result = transport.deliver_due();
         assert_eq!(result.delivered.len(), 1);
@@ -367,5 +378,52 @@ mod tests {
         // The message may or may not deserialize depending on which bit was flipped.
         // Either way, we should get exactly 1 result total.
         assert_eq!(result.delivered.len() + result.corrupted.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_then_delay_preserves_both_copies() {
+        let mut transport = MockTransport::new(42);
+        transport.add_interceptor(Box::new(DuplicateAll));
+        transport.add_interceptor(Box::new(DelayTicks(2)));
+        transport.send(NodeId(1), NodeId(2), &test_msg());
+
+        // Both copies should be delayed: baseline 1 + 2 extra = tick 3
+        for _ in 0..2 {
+            transport.advance_tick();
+            assert!(transport.deliver_due().delivered.is_empty());
+        }
+        transport.advance_tick();
+        let result = transport.deliver_due();
+        assert_eq!(result.delivered.len(), 2, "both duplicated copies must survive delay");
+    }
+
+    #[test]
+    fn delay_zero_delivers_next_tick() {
+        let mut transport = MockTransport::new(42);
+        transport.add_interceptor(Box::new(DelayTicks(0)));
+        transport.send(NodeId(1), NodeId(2), &test_msg());
+
+        // DelayTicks(0) = baseline only = deliver at tick 1
+        let result = transport.deliver_due();
+        assert!(result.delivered.is_empty(), "not yet at tick 1");
+        transport.advance_tick();
+        let result = transport.deliver_due();
+        assert_eq!(result.delivered.len(), 1);
+    }
+
+    #[test]
+    fn drop_in_flight_for_node() {
+        let mut transport = MockTransport::new(42);
+        transport.send(NodeId(1), NodeId(2), &test_msg());
+        transport.send(NodeId(3), NodeId(2), &test_msg());
+        assert_eq!(transport.in_flight_count(), 2);
+
+        transport.drop_in_flight_for(NodeId(1));
+        assert_eq!(transport.in_flight_count(), 1);
+
+        transport.advance_tick();
+        let result = transport.deliver_due();
+        assert_eq!(result.delivered.len(), 1);
+        assert_eq!(result.delivered[0].from, NodeId(3));
     }
 }

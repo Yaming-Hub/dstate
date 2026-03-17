@@ -158,7 +158,9 @@ impl NetworkInterceptor for Partition {
     }
 }
 
-/// Delays all messages by a fixed number of ticks.
+/// Delays all messages by an additional number of ticks beyond the baseline
+/// 1-tick latency. `DelayTicks(0)` behaves like normal delivery (1 tick).
+/// `DelayTicks(3)` delivers after 4 ticks total (1 baseline + 3 extra).
 pub struct DelayTicks(pub usize);
 
 impl NetworkInterceptor for DelayTicks {
