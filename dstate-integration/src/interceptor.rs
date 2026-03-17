@@ -34,6 +34,23 @@ pub struct InterceptContext {
 ///
 /// Each interceptor sees every message and decides what to do with it.
 /// Multiple interceptors can be chained; the output of one feeds the next.
+///
+/// # Chaining semantics
+///
+/// - `Deliver` and `DeliverMany` pass messages to the next interceptor.
+/// - `Drop` removes the message from the pipeline.
+/// - `Delay` **finalizes** the message: it is queued with the requested
+///   delay and **skips all subsequent interceptors**. This means a chain
+///   like `[DelayTicks(5), DropRate(0.5)]` will never drop delayed
+///   messages. Place delay interceptors last if you want earlier
+///   interceptors to modify/filter first.
+///
+/// # Broadcast messages
+///
+/// When `MockTransport::broadcast` is used, each recipient gets an
+/// independent `send_bytes` call with a unique `message_id`. This means
+/// probabilistic interceptors (e.g., `DropRate`) make independent
+/// decisions per link, which models realistic independent network paths.
 pub trait NetworkInterceptor: Send {
     /// Inspect a message in transit and return an action controlling delivery.
     fn intercept(

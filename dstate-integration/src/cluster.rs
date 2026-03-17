@@ -95,6 +95,10 @@ where
         V: Clone,
     {
         let new_id = engine.node_id();
+        assert!(
+            !self.nodes.contains_key(&new_id),
+            "node {new_id} already exists in cluster"
+        );
 
         // Announce new node to all existing nodes; collect actions first
         let existing_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
@@ -210,18 +214,22 @@ where
         }
 
         // Phase 3: Flush change feeds
+        // Only advance the flush counter while there are pending feed items,
+        // so idle time doesn't consume the batch interval.
         for &node_id in &node_ids {
             let node = self.nodes.get_mut(&node_id).unwrap();
-            node.feed_flush_counter += 1;
-            if node.feed_flush_interval > 0
-                && node.feed_flush_counter >= node.feed_flush_interval
-            {
-                node.feed_flush_counter = 0;
-                if let Some(feed) = node.engine.flush_change_feed() {
-                    let all_nodes = self.all_node_ids();
-                    self.transport
-                        .broadcast(node_id, &WireMessage::Feed(feed), &all_nodes);
+            if node.engine.pending_change_feed_count() > 0 {
+                node.feed_flush_counter += 1;
+                if node.feed_flush_counter >= node.feed_flush_interval {
+                    node.feed_flush_counter = 0;
+                    if let Some(feed) = node.engine.flush_change_feed() {
+                        let all_nodes = self.all_node_ids();
+                        self.transport
+                            .broadcast(node_id, &WireMessage::Feed(feed), &all_nodes);
+                    }
                 }
+            } else {
+                node.feed_flush_counter = 0;
             }
         }
 
@@ -359,8 +367,13 @@ where
                 EngineAction::ScheduleDelayed { delay, message } => {
                     let delay_ms = delay.as_millis() as u64;
                     let tick_ms = self.tick_duration.as_millis().max(1) as u64;
-                    // Round up so sub-tick delays still wait at least 1 tick
-                    let delay_ticks = delay_ms.div_ceil(tick_ms).max(1);
+                    // Zero delay = broadcast immediately (next tick via transport).
+                    // Non-zero sub-tick delays round up to at least 1 tick.
+                    let delay_ticks = if delay_ms == 0 {
+                        0
+                    } else {
+                        delay_ms.div_ceil(tick_ms).max(1)
+                    };
                     if let Some(node) = self.nodes.get_mut(&from) {
                         node.scheduled.push(ScheduledAction {
                             message: message.clone(),
