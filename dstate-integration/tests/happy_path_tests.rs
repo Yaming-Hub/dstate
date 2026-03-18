@@ -21,6 +21,10 @@ use dstate_integration::cluster::MockCluster;
 
 /// Route engine actions through the cluster transport manually.
 /// Use when calling `engine_mut().mutate()` directly (which doesn't auto-route).
+///
+/// Note: `ScheduleDelayed` actions are skipped here — they can only be
+/// properly handled by `MockCluster::tick()` internal scheduling. Tests
+/// that need delayed delivery should use `cluster.mutate()` instead.
 fn route_actions<S, V>(cluster: &mut MockCluster<S, V>, from: NodeId, actions: &[EngineAction])
 where
     S: Clone + Send + Sync + 'static,
@@ -40,13 +44,9 @@ where
                     .send(from, *target, &WireMessage::Sync(message.clone()));
             }
             EngineAction::ScheduleDelayed { .. } => {
-                // ScheduleDelayed is handled inside tick() for nodes; to route it
-                // externally we broadcast immediately (the settle loop will deliver).
-                if let EngineAction::ScheduleDelayed { message, .. } = action {
-                    cluster
-                        .transport_mut()
-                        .broadcast(from, &WireMessage::Sync(message.clone()), &all_nodes);
-                }
+                // Intentionally skipped — ScheduleDelayed must go through
+                // MockCluster's internal tick scheduling. Use cluster.mutate()
+                // when you need delayed actions to propagate properly.
             }
         }
     }
@@ -211,11 +211,12 @@ fn int_03_change_feed_batching() {
 
     // After settle, peers should have received the feed and pulled data
     let metrics = cluster.engine(NodeId(0)).metrics();
-    // No direct snapshots were broadcast (feed mode) — but snapshot requests
-    // from peers cause snapshots_sent to be > 0 after pull.
+    assert_eq!(metrics.total_mutations, 5, "all 5 mutations should be recorded");
+    // In FeedLazyPull mode, peers pull via RequestSnapshot after receiving
+    // change feed notifications, so node 0 should have sent snapshots.
     assert!(
-        metrics.snapshots_sent > 0 || metrics.total_mutations == 5,
-        "mutations should be recorded"
+        metrics.snapshots_sent > 0,
+        "peers should have pulled snapshots via RequestSnapshot"
     );
 }
 
@@ -310,9 +311,11 @@ fn int_06_pull_on_stale_query() {
         SyncUrgency::Default,
     );
 
-    // Don't settle — just tick a few times to let change feed propagate
-    // but not enough for full pull resolution
+    // Don't settle — tick enough for change feed to propagate but not resolve
     cluster.tick_n(5);
+
+    // Advance clock further to ensure views become stale relative to max_staleness=0
+    cluster.tick_n(10);
 
     // Query on node 1 with max_staleness = 0 (demand perfect freshness)
     let (query_result, actions) = cluster.engine(NodeId(1)).query(
@@ -327,8 +330,7 @@ fn int_06_pull_on_stale_query() {
             assert!(!actions.is_empty(), "should have pull actions (RequestSnapshot)");
         }
         EngineQueryResult::Fresh(_) => {
-            // If data propagated fast enough, Fresh is also valid.
-            // But with ZERO staleness and feed-only mode, Stale is expected.
+            panic!("expected Stale with ZERO max_staleness after clock advancement");
         }
     }
 }
@@ -379,7 +381,33 @@ fn int_07_generation_ordering() {
 #[test]
 fn int_08_node_join_snapshot_exchange() {
     let config = active_push_config();
-    let mut cluster = MockCluster::with_test_state(3, config.clone());
+
+    // Build cluster manually so we can share the clock with the new node
+    let clock = Arc::new(TestClock::with_base_unix_ms(1_000_000));
+    let tick_duration = Duration::from_millis(100);
+    let mut cluster = MockCluster::new(clock.clone(), tick_duration, 42);
+
+    // Build and add 3 nodes
+    for i in 0..3 {
+        let engine = DistributedStateEngine::new(
+            TestState::name(),
+            NodeId(i),
+            TestState::default(),
+            |s| s.clone(),
+            config.clone(),
+            TestState::WIRE_VERSION,
+            clock.clone(),
+            |v| bincode::serialize(v).unwrap(),
+            |b, v| {
+                if v != TestState::WIRE_VERSION {
+                    return Err(DeserializeError::unknown_version(v));
+                }
+                bincode::deserialize(b).map_err(|e| DeserializeError::Malformed(e.to_string()))
+            },
+            None,
+        );
+        cluster.add_node(engine, TestState::default());
+    }
 
     // Mutate each node
     for i in 0..3 {
@@ -395,8 +423,7 @@ fn int_08_node_join_snapshot_exchange() {
     }
     cluster.settle();
 
-    // Add a 4th node
-    let clock = Arc::new(TestClock::with_base_unix_ms(1_000_000));
+    // Add a 4th node with the SAME shared clock
     let engine = DistributedStateEngine::new(
         TestState::name(),
         NodeId(3),
@@ -404,7 +431,7 @@ fn int_08_node_join_snapshot_exchange() {
         |s| s.clone(),
         config,
         TestState::WIRE_VERSION,
-        clock,
+        clock.clone(),
         |v| bincode::serialize(v).unwrap(),
         |b, v| {
             if v != TestState::WIRE_VERSION {
@@ -579,6 +606,7 @@ fn int_12_suppress_skips_broadcast() {
 fn int_13_delayed_schedules_timer() {
     let mut cluster = MockCluster::with_test_state(2, active_push_config());
 
+    // First verify the action type by calling engine_mut directly
     let result = cluster.engine_mut(NodeId(0)).mutate(
         |s| { s.counter = 7; },
         |s| s.clone(),
@@ -595,13 +623,24 @@ fn int_13_delayed_schedules_timer() {
         result.actions
     );
 
-    // Route the actions so the scheduled timer is registered in the cluster
-    route_actions(&mut cluster, NodeId(0), &result.actions);
+    // Now use cluster.mutate() to properly route through the delay mechanism.
+    // (The engine already has counter=7, so mutate again to test propagation.)
+    cluster.mutate(
+        NodeId(0),
+        |s| { s.counter = 8; },
+        |s| s.clone(),
+        SyncUrgency::Delayed(Duration::from_millis(500)),
+    );
+
+    // Before enough ticks, peer should not see the update
+    cluster.tick_n(2);
+    let view = cluster.engine(NodeId(1)).get_view(&NodeId(0)).unwrap();
+    assert_eq!(view.value.counter, 0, "peer should not see update before delay expires");
 
     // After settling (which processes scheduled timers), peer should see the update
     cluster.settle();
     let view = cluster.engine(NodeId(1)).get_view(&NodeId(0)).unwrap();
-    assert_eq!(view.value.counter, 7);
+    assert_eq!(view.value.counter, 8);
 }
 
 // ── INT-14: Query freshness fast path ───────────────────────────
@@ -654,12 +693,15 @@ fn int_15_query_freshness_slow_path() {
     let config = feed_lazy_pull_config();
     let mut cluster = MockCluster::with_test_state(3, config);
 
-    // Mutate node 0 but don't propagate at all
+    // Mutate node 0 but suppress propagation
     cluster.engine_mut(NodeId(0)).mutate(
         |s| { s.counter = 50; },
         |s| s.clone(),
-        SyncUrgency::Suppress, // Suppress to avoid any propagation
+        SyncUrgency::Suppress,
     );
+
+    // Advance clock to ensure views become stale relative to max_staleness=0
+    cluster.tick_n(20);
 
     // Query on node 1 with max_staleness = 0
     let (result, _actions) = cluster.engine(NodeId(1)).query(
@@ -669,19 +711,16 @@ fn int_15_query_freshness_slow_path() {
 
     match result {
         EngineQueryResult::Stale { stale_peers, .. } => {
-            // Node 0's view on node 1 has generation zero (never updated remotely),
-            // but node 1 only knows about generation zero from the on_node_joined
-            // default view, so it may or may not be stale depending on the clock.
-            // With ZERO max_staleness and feed_lazy_pull, stale detection is likely.
             assert!(
                 !stale_peers.is_empty(),
-                "should detect stale peers with zero staleness"
+                "should detect stale peers with zero staleness after clock advancement"
             );
         }
         EngineQueryResult::Fresh(_) => {
-            // If the clock hasn't advanced at all, all views might appear fresh
-            // (they were just created). This is acceptable in this edge case.
-            // The key test is that the query API works end-to-end.
+            panic!(
+                "expected Stale with ZERO max_staleness after clock advancement, \
+                 but got Fresh — staleness detection may be broken"
+            );
         }
     }
 }
