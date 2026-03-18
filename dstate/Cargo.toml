@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Distributed state replication across actor-based clusters"
 license = "MIT"
+repository = "https://github.com/Yaming-Hub/dstate"
+homepage = "https://github.com/Yaming-Hub/dstate"
+readme = "../README.md"
+keywords = ["distributed", "state", "replication", "actor", "crdt"]
+categories = ["concurrency", "network-programming"]
 
 [dependencies]
 arc-swap = "1"

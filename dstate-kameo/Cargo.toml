@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2021"
 description = "Kameo adapter for the dstate distributed state crate"
 license = "MIT"
+repository = "https://github.com/Yaming-Hub/dstate"
+homepage = "https://github.com/Yaming-Hub/dstate"
+readme = "README.md"
+keywords = ["distributed", "state", "replication", "kameo", "actor"]
+categories = ["concurrency", "network-programming"]
 
 [dependencies]
-dstate = { path = "../dstate" }
+dstate = { version = "0.1.0", path = "../dstate" }
 kameo = "0.19.2"
 tokio = { version = "1", features = ["time", "rt", "sync"] }
 
