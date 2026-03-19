@@ -169,6 +169,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dstate-e2e"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "dstate",
+ "dstate-kameo",
+ "dstate-ractor",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "dstate-integration"
 version = "0.1.0"
 dependencies = [
