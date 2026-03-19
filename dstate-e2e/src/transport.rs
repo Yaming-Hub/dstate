@@ -31,6 +31,11 @@ impl InProcessTransport {
     }
 
     /// Route a message through interceptors, then deliver to the target node.
+    ///
+    /// **Note**: When a `Delay` interceptor fires, the message is scheduled
+    /// for future delivery and the remaining interceptors in the chain are
+    /// skipped. Place `Delay` interceptors last in the pipeline to ensure
+    /// other interceptors (e.g., `DropRate`, `Partition`) run first.
     pub fn send(&self, from: NodeId, to: NodeId, data: Vec<u8>) {
         let interceptors = self.interceptors.lock().unwrap();
         let mut current_data = data;

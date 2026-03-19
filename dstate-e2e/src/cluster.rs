@@ -432,6 +432,28 @@ impl<R: TestableRuntime> TestCluster<R> {
         }
     }
 
+    /// Assert that `observer` does NOT see `target`'s counter reach `forbidden_value`
+    /// within `duration`. Returns `true` if the value was correctly never observed.
+    pub async fn assert_not_visible(
+        &self,
+        observer: NodeId,
+        target: NodeId,
+        forbidden_value: u64,
+        duration: Duration,
+    ) -> bool {
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < duration {
+            let snapshot = self.query(observer).await;
+            if let Some(view) = snapshot.get(&target) {
+                if view.value.counter == forbidden_value {
+                    return false;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
     /// Access the transport (e.g., for adding interceptors).
     pub fn transport(&self) -> &Arc<InProcessTransport> {
         &self.transport
