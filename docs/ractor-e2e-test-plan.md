@@ -33,40 +33,64 @@ with the cluster through an async control API.
 
 ## Architecture
 
+```mermaid
+graph TB
+    subgraph TestCluster
+        subgraph TestNode0["TestNode(0)"]
+            RT0[RactorRuntime]
+            E0[DistributedStateEngine]
+            A0[StateActor<br/><i>ractor actor · owns engine</i>]
+            RT0 --- A0
+            E0 --- A0
+        end
+        subgraph TestNode1["TestNode(1)"]
+            RT1[RactorRuntime]
+            E1[DistributedStateEngine]
+            A1[StateActor<br/><i>ractor actor · owns engine</i>]
+            RT1 --- A1
+            E1 --- A1
+        end
+        subgraph Transport["InProcessTransport"]
+            IC[Interceptor Pipeline<br/>Partition → DropRate → Delay]
+            CH[tokio mpsc channels<br/><i>serialize → Vec‹u8› → route → deserialize</i>]
+            IC --> CH
+        end
+        A0 <-->|WireMessage bytes| Transport
+        A1 <-->|WireMessage bytes| Transport
+    end
+    subgraph API["Async Control API"]
+        M["mutate(node, fn) → result"]
+        Q["query(node, fn) → views"]
+        W["wait_convergence(timeout)"]
+        N["add_node() / remove_node()"]
+        F["inject_partition() / heal_partition()"]
+    end
+    API -->|oneshot request-reply| TestCluster
 ```
-┌──────────────────────────────────────────────────────┐
-│                    TestCluster                        │
-│  ┌─────────────┐  ┌─────────────┐                    │
-│  │  TestNode(0) │  │  TestNode(1) │  ...              │
-│  │ ┌──────────┐│  │ ┌──────────┐│                    │
-│  │ │RactorRT  ││  │ │RactorRT  ││                    │
-│  │ └──────────┘│  │ └──────────┘│                    │
-│  │ ┌──────────┐│  │ ┌──────────┐│                    │
-│  │ │  Engine   ││  │ │  Engine   ││                    │
-│  │ │(dstate)   ││  │ │(dstate)   ││                    │
-│  │ └──────────┘│  │ └──────────┘│                    │
-│  │ ┌──────────┐│  │ ┌──────────┐│                    │
-│  │ │StateActor ││  │ │StateActor ││  ← ractor actor   │
-│  │ │(owns eng) ││  │ │(owns eng) ││    (mailbox)      │
-│  │ └─────┬────┘│  │ └─────┬────┘│                    │
-│  └───────┼─────┘  └───────┼─────┘                    │
-│          │                │                           │
-│  ┌───────┴────────────────┴───────────────────┐      │
-│  │           InProcessTransport               │      │
-│  │  ┌──────────────────────────────────────┐  │      │
-│  │  │   Interceptor Pipeline (optional)    │  │      │
-│  │  │  [Partition] → [DropRate] → [Delay]  │  │      │
-│  │  └──────────────────────────────────────┘  │      │
-│  │  serialize → Vec<u8> → route → deserialize │      │
-│  │  (tokio mpsc channels per node)            │      │
-│  └────────────────────────────────────────────┘      │
-├──────────────────────────────────────────────────────┤
-│               Async Control API                      │
-│  mutate(node, fn) → result    add_node(config)       │
-│  query(node, fn) → views      remove_node(id)        │
-│  wait_convergence(timeout)    inject_partition(a,b)   │
-│  get_metrics(node) → metrics  heal_partition()        │
-└──────────────────────────────────────────────────────┘
+
+### Message Flow
+
+```mermaid
+sequenceDiagram
+    participant Test
+    participant NodeA as StateActor(0)
+    participant Transport as InProcessTransport
+    participant NodeB as StateActor(1)
+
+    Test->>NodeA: Mutate { fn, reply_tx }
+    activate NodeA
+    NodeA->>NodeA: engine.mutate() → actions
+    NodeA-->>Test: reply_tx.send(result)
+    NodeA->>Transport: BroadcastSync(bytes)
+    deactivate NodeA
+    Transport->>Transport: interceptors → serialize
+    Transport->>NodeB: HandleInbound { wire_bytes }
+    activate NodeB
+    NodeB->>NodeB: deserialize → engine.handle_inbound()
+    deactivate NodeB
+    Test->>Test: wait_for_convergence()
+    Test->>NodeB: Query { reply_tx }
+    NodeB-->>Test: views (counter=42 ✓)
 ```
 
 ## Component Design
