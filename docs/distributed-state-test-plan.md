@@ -1,5 +1,11 @@
 # Distributed State — Test Plan
 
+> **⚠️ Historical Document (v0.1):** This test plan was written for the v0.1 multi-crate
+> architecture with `dstate-ractor`, `dstate-kameo`, and `TestRuntime`. As of v1.0,
+> adapter crates have been removed and runtime abstraction moved to the `dactor` crate.
+> See [distributed-state-design.md §6.0](./distributed-state-design.md#60-actor-runtime--dactor-integration)
+> for the current architecture.
+
 This test plan covers the distributed state **multi-crate workspace** as
 specified in [distributed-state-design.md](./distributed-state-design.md).
 Tests are organized by design section and grouped into unit, integration,

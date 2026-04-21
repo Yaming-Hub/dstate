@@ -1,5 +1,12 @@
 # dstate End-to-End Integration Test Plan
 
+> **⚠️ Historical Document (v0.1):** This E2E test plan was written for the v0.1
+> architecture with `dstate-ractor`, `dstate-kameo`, and the `dstate-e2e` shared
+> test crate. As of v1.0, these adapter crates have been removed and the `dstate-e2e`
+> crate has been deleted. Integration testing now uses `dstate-integration` with
+> `MockCluster`. See [distributed-state-design.md §6.0](./distributed-state-design.md#60-actor-runtime--dactor-integration)
+> for the current architecture.
+
 ## Problem
 
 The adapter crates (`dstate-ractor`, `dstate-kameo`) currently test only

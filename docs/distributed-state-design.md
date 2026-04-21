@@ -491,7 +491,7 @@ in broadcast traffic for frequently-mutated states.
 #### 4.2.3 ChangeFeedAggregator Actor
 
 Each node runs **one** `ChangeFeedAggregator` actor (not per-state — that
-would defeat batching). See [§6.5](#65-changefeedaggregator-actor) for full
+would defeat batching). See [§6.5](#65-changefeedaggregator) for full
 actor design.
 
 Key responsibilities:
@@ -955,13 +955,14 @@ dstate-specific runtime abstractions or adapter crates.
 ### 6.0 Actor Runtime — dactor Integration
 
 The distributed state crate requires exactly five capabilities from the
-underlying actor framework. All five are provided by `dactor`'s trait
-hierarchy:
+underlying actor framework. Three are provided by `dactor`'s trait hierarchy
+(cluster events, timers, error types); two are fulfilled by the user's
+actor shell code using `dactor` directly (actor spawning, messaging):
 
 ```mermaid
 graph TD
     DS["dstate crate"]
-    DS -->|"uses"| DA["dactor crate<br/>(ActorRuntime, ActorRef,<br/>ClusterEvents, TimerHandle)"]
+    DS -->|"uses"| DA["dactor crate<br/>(NodeId, ClusterEvents,<br/>TimerHandle, error types)"]
 
     subgraph "dactor backends (cargo feature)"
         Ractor["ractor backend"]
@@ -976,28 +977,25 @@ graph TD
 
 #### 6.0.1 Required Capabilities
 
-| # | Capability | Why the crate needs it | dactor Trait |
+| # | Capability | Why the crate needs it | Provided by |
 |---|---|---|---|
-| 1 | **Single-threaded actor execution** | StateShard and SyncEngine process messages one at a time — no locks needed for state mutation or view-map swaps. | `dactor::ActorRuntime` |
-| 2 | **Remote actor messaging** | SyncEngine sends snapshots/deltas to peer SyncEngines on other nodes. Fire-and-forget (`send`) is the primary pattern; request-reply is framework-specific and handled at the dactor layer. | `dactor::ActorRef<M>` |
-| 3 | **Actor registration / discovery** | The StateRegistry must look up StateShard actors by name. Peer SyncEngines must discover each other across nodes. | `dactor::ActorRuntime::get_group_members` |
-| 4 | **Cluster node join/leave events** | ClusterMembership listener must be notified when nodes join or leave so it can propagate events to all StateShards. | `dactor::ClusterEvents` |
-| 5 | **Message broadcasting** | SyncEngine broadcasts snapshots/deltas to all peers of the same state type. ChangeFeedAggregator broadcasts batched notifications to all peer aggregators. | `dactor::ActorRuntime::broadcast_group` |
+| 1 | **Single-threaded actor execution** | StateShard and SyncEngine process messages one at a time — no locks needed for state mutation or view-map swaps. | User's actor shell (using dactor's actor spawning directly) |
+| 2 | **Remote actor messaging** | SyncEngine sends snapshots/deltas to peer SyncEngines on other nodes. Fire-and-forget (`send`) is the primary pattern. | User's actor shell (using dactor's `ActorRef` directly) |
+| 3 | **State registration / discovery** | The StateRegistry must look up registered state shards by name. | `dstate::StateRegistry` (plain struct, not generic over any runtime) |
+| 4 | **Cluster node join/leave events** | ClusterMembership listener must be notified when nodes join or leave so it can propagate events to all StateShards. | `dactor::ClusterEvents` (re-exported by dstate) |
+| 5 | **Message broadcasting** | SyncEngine broadcasts snapshots/deltas to all peers of the same state type. ChangeFeedAggregator broadcasts batched notifications to all peer aggregators. | User's actor shell (using dactor's group features directly) |
 
 #### 6.0.2 Trait Definitions (from dactor)
 
-`dstate` imports these traits from the `dactor` crate. The definitions below
-are reproduced for reference — see the `dactor` documentation for the
-authoritative versions.
+`dstate` re-exports the following types from the `dactor` crate. See the
+`dactor` documentation for the authoritative trait definitions.
 
 ```rust
-// All traits are defined and implemented in the `dactor` crate.
-// dstate uses them via `use dactor::{ActorRuntime, ActorRef, ...};`
-
-/// A handle to a running actor that can receive messages of type `M`.
-pub trait ActorRef<M: Send + 'static>: Clone + Send + Sync + 'static {
-    fn send(&self, msg: M) -> Result<(), ActorSendError>;
-}
+// Re-exported in dstate via traits/runtime.rs:
+//   dactor::cluster::{ClusterEvent, ClusterEvents, SubscriptionId}
+//   dactor::timer::TimerHandle
+//   dactor::errors::{ActorSendError, ClusterError, GroupError}
+//   dactor::NodeId  (re-exported via types/node.rs)
 
 /// Subscription to cluster-level node membership events.
 pub trait ClusterEvents: Send + Sync + 'static {
@@ -1012,45 +1010,13 @@ pub trait ClusterEvents: Send + Sync + 'static {
 pub trait TimerHandle: Send + 'static {
     fn cancel(self);
 }
-
-/// The top-level runtime abstraction. One instance per node.
-pub trait ActorRuntime: Send + Sync + 'static {
-    type Ref<M: Send + 'static>: ActorRef<M>;
-    type Events: ClusterEvents;
-    type Timer: TimerHandle;
-
-    fn spawn<M, H>(&self, name: &str, handler: H) -> Self::Ref<M>
-    where
-        M: Send + 'static,
-        H: FnMut(M) + Send + 'static;
-
-    fn send_interval<M: Clone + Send + 'static>(
-        &self, target: &Self::Ref<M>, interval: Duration, msg: M,
-    ) -> Self::Timer;
-
-    fn send_after<M: Send + 'static>(
-        &self, target: &Self::Ref<M>, delay: Duration, msg: M,
-    ) -> Self::Timer;
-
-    fn join_group<M: Send + 'static>(
-        &self, group_name: &str, actor: &Self::Ref<M>,
-    ) -> Result<(), GroupError>;
-
-    fn leave_group<M: Send + 'static>(
-        &self, group_name: &str, actor: &Self::Ref<M>,
-    ) -> Result<(), GroupError>;
-
-    fn broadcast_group<M: Clone + Send + 'static>(
-        &self, group_name: &str, msg: M,
-    ) -> Result<(), GroupError>;
-
-    fn get_group_members<M: Send + 'static>(
-        &self, group_name: &str,
-    ) -> Result<Vec<Self::Ref<M>>, GroupError>;
-
-    fn cluster_events(&self) -> &Self::Events;
-}
 ```
+
+> **Note:** `dstate` does **not** use `dactor::ActorRuntime` or
+> `dactor::ActorRef`. Actor spawning, messaging, groups, and broadcasting
+> are the responsibility of the user's actor shell code, which interacts
+> with `dactor` directly. The `DistributedStateEngine` is a pure state
+> machine that returns `Vec<EngineAction>` — no actors, no I/O.
 
 #### 6.0.3 Crate Architecture
 
@@ -1087,8 +1053,8 @@ graph TD
 
 | Crate | Role | Dependencies |
 |---|---|---|
-| `dstate` | Core library. Defines state traits (`DistributedState`, `DeltaDistributedState`), persistence traits (`StatePersistence`), clock abstraction (`Clock`), data types (`StateObject`, `StateViewObject`, `SyncMessage`, etc.), pure logic (`ShardCore`, `SyncLogic`, etc.), error types, and configuration structs. Re-exports runtime traits from `dactor`. | `dactor`, `arc-swap`, `tokio` (time only) |
-| `dactor` | Actor runtime abstraction. Defines `ActorRuntime`, `ActorRef`, `ClusterEvents`, `TimerHandle` traits with concrete implementations for ractor, kameo, and coerce (selected via cargo features). | `ractor` or `kameo` or `coerce` (feature-gated) |
+| `dstate` | Core library. Defines state traits (`DistributedState`, `DeltaDistributedState`), persistence traits (`StatePersistence`), clock abstraction (`Clock`), data types (`StateObject`, `StateViewObject`, `SyncMessage`, etc.), pure logic (`ShardCore`, `SyncLogic`, etc.), the `DistributedStateEngine` (pure state machine returning `Vec<EngineAction>`), error types, and configuration structs. Re-exports `NodeId`, `ClusterEvents`, `TimerHandle`, and error types from `dactor`. | `dactor`, `arc-swap`, `tokio` (time only) |
+| `dactor` | Actor runtime abstraction. Provides `NodeId` (String-based), `ClusterEvents`, `TimerHandle`, `ClusterEvent`, `SubscriptionId`, and error types (`ActorSendError`, `ClusterError`, `GroupError`) used by dstate. Also defines `ActorRuntime`, `ActorRef`, and group APIs — but those are used by application actor shells, not by dstate itself. | `ractor` or `kameo` or `coerce` (feature-gated) |
 
 **Removed crates (previously in v0.1):**
 
@@ -1105,13 +1071,13 @@ backend feature:
 # Application Cargo.toml
 [dependencies]
 dstate = "1.0"
-dactor = { version = "0.1", features = ["ractor"] }  # or "kameo" or "coerce"
+dactor = { version = "0.2", features = ["ractor"] }  # or "kameo" or "coerce"
 ```
 
 ```rust
 // Application code — runtime traits come through dactor
 use dstate::{DistributedState, DeltaDistributedState, StateConfig, SyncStrategy};
-use dactor::{ActorRuntime, ActorRef};
+use dactor::ActorRuntime;  // used by the app's actor shell, not by dstate
 ```
 
 #### Core Crate (`dstate`) Module Layout
@@ -1119,12 +1085,13 @@ use dactor::{ActorRuntime, ActorRef};
 ```
 dstate/
 ├── src/
-│   ├── lib.rs              // Public API re-exports (re-exports dactor runtime traits)
+│   ├── lib.rs              // Public API re-exports (re-exports dactor cluster/timer/error types)
 │   ├── traits/
 │   │   ├── mod.rs
 │   │   ├── state.rs        // DistributedState, DeltaDistributedState traits
 │   │   ├── persistence.rs  // StatePersistence trait (saves StateObject<S>)
-│   │   └── clock.rs        // Clock trait, SystemClock
+│   │   ├── clock.rs        // Clock trait, SystemClock
+│   │   └── runtime.rs      // Re-exports from dactor (ClusterEvents, TimerHandle, errors)
 │   ├── types/
 │   │   ├── mod.rs
 │   │   ├── envelope.rs     // StateObject, StateViewObject
@@ -1132,30 +1099,40 @@ dstate/
 │   │   ├── config.rs       // StateConfig, SyncStrategy, PushMode, ChangeFeedConfig
 │   │   ├── errors.rs       // RegistryError, QueryError, MutationError,
 │   │   │                   //   DeserializeError
-│   │   └── node.rs         // NodeId, VersionMismatchPolicy
+│   │   └── node.rs         // NodeId (re-exported from dactor), Generation, VersionMismatchPolicy
 │   ├── core/
 │   │   ├── mod.rs
-│   │   ├── shard_core.rs   // ShardCore — pure state machine logic
-│   │   ├── sync_logic.rs   // Urgency dispatch, delta accumulation,
-│   │   │                   //   broadcast/pull decision logic
-│   │   ├── change_feed.rs  // ChangeFeed aggregation logic
-│   │   └── versioning.rs   // Wire version comparison, mismatch policy
+│   │   ├── shard_core.rs           // ShardCore — pure state machine logic
+│   │   ├── sync_logic.rs           // Urgency dispatch, delta accumulation,
+│   │   │                           //   broadcast/pull decision logic
+│   │   ├── change_feed_logic.rs    // ChangeFeed aggregation logic
+│   │   ├── versioning_logic.rs     // Wire version comparison, mismatch policy
+│   │   ├── lifecycle_logic.rs      // Node join/leave lifecycle management
+│   │   ├── diagnostics.rs          // Per-peer sync diagnostics and health tracking
+│   │   ├── delta_accumulator.rs    // Delta batching and accumulation
+│   │   ├── persistence_startup_logic.rs // Persistence load/save on startup
+│   │   └── view_map.rs             // ArcSwap-backed concurrent view map
 │   ├── messages/
 │   │   ├── mod.rs
 │   │   ├── shard_msg.rs    // StateShardMsg, SimpleShardMsg, DeltaShardMsg
 │   │   ├── sync_msg.rs     // SyncEngineMsg
 │   │   └── feed_msg.rs     // ChangeFeedMsg
-│   ├── registry.rs         // StateRegistry<R: dactor::ActorRuntime>, AnyStateShard trait
+│   ├── engine.rs            // DistributedStateEngine — public pure API
+│   ├── registry.rs          // StateRegistry (plain struct), AnyStateShard trait
 │   └── test_support/
 │       ├── mod.rs
-│       ├── test_clock.rs   // TestClock implementation
-│       └── test_persist.rs // InMemoryPersistence, FailingPersistence
+│       ├── test_clock.rs    // TestClock implementation
+│       ├── test_persist.rs  // InMemoryPersistence, FailingPersistence
+│       ├── test_runtime.rs  // TestClusterEvents, TestTimerHandle
+│       └── test_state.rs    // TestState, TestDeltaState example implementations
 ```
 
-**Key change from v0.1:** The `traits/runtime.rs` module is **removed**. All
-runtime traits (`ActorRuntime`, `ActorRef`, `ClusterEvents`, `TimerHandle`)
-are now imported from `dactor`. The `test_support/` module uses dactor's own
-test runtime (or a dstate-local `TestRuntime` that implements dactor's traits).
+**Key change from v0.1:** The `traits/runtime.rs` module is **simplified**. It
+re-exports only `ClusterEvents`, `TimerHandle`, `ClusterEvent`, `SubscriptionId`,
+and error types (`ActorSendError`, `ClusterError`, `GroupError`) from `dactor`.
+`ActorRuntime` and `ActorRef` are **not** imported by dstate — those are used
+by the application's actor shell code directly via dactor. The `test_support/`
+module provides test doubles for deterministic testing without any actor framework.
 
 **Key design principle:** The `core/` module contains **all pure logic** with
 no dependency on any actor runtime. The `dactor`-backed runtime wires these
@@ -1175,23 +1152,33 @@ pub use traits::state::{DistributedState, DeltaDistributedState, SyncUrgency};
 pub use traits::persistence::{StatePersistence, PersistError};
 pub use traits::clock::{Clock, SystemClock};
 
-// ── Runtime traits (re-exported from dactor) ────────────────────
-pub use dactor::{
-    ActorRuntime, ActorRef, ClusterEvents, TimerHandle,
-    ClusterEvent, SubscriptionId, ActorSendError, GroupError, ClusterError,
+// ── Runtime abstractions (cluster events, timers, errors) ───────
+pub use traits::runtime::{
+    ActorSendError, ClusterError, ClusterEvent, ClusterEvents, GroupError,
+    SubscriptionId, TimerHandle,
 };
 
 // ── Types (what users construct / receive) ──────────────────────
 pub use types::envelope::{StateObject, StateViewObject};
 pub use types::config::{StateConfig, SyncStrategy, PushMode, ChangeFeedConfig};
-pub use types::node::{NodeId, VersionMismatchPolicy};
+pub use types::node::{NodeId, Generation, VersionMismatchPolicy};
 pub use types::errors::{
     RegistryError, QueryError, MutationError, DeserializeError,
 };
 pub use types::sync_message::{SyncMessage, ChangeNotification, BatchedChangeFeed};
 
-// ── Test support (feature-gated or cfg(test)) ───────────────────
-pub mod test_support;  // TestClock, InMemoryPersistence, FailingPersistence
+// ── Registry (state registration and lookup) ────────────────────
+pub use registry::{AnyStateShard, StateRegistry};
+
+// ── Engine (public API for driving the replication protocol) ─────
+pub mod engine;
+pub use engine::{
+    DistributedStateEngine, EngineAction, EngineHealth, EngineQueryResult, HealthStatus,
+    MutateResult, DeltaMutateResult, SyncMetrics, WireMessage,
+};
+
+// ── Test support (public for adapter crates and downstream tests) ─
+pub mod test_support;
 ```
 
 **Visibility rules by module:**
@@ -1211,14 +1198,16 @@ pub mod test_support;  // TestClock, InMemoryPersistence, FailingPersistence
 | `types/` | Data structs, enums, error types | ❌ |
 | `core/` | `ShardCore`, sync logic, change feed logic | ❌ (pure functions and state machines) |
 | `messages/` | Message enum definitions | ❌ (just data types) |
-| `registry.rs` | `StateRegistry<R>` | ✅ Generic over `R: dactor::ActorRuntime` |
+| `registry.rs` | `StateRegistry` | ❌ (plain struct, uses `dyn AnyStateShard`) |
 | `test_support/` | Test doubles and harness | Uses dactor's test runtime or local impl of dactor traits |
 
 ### 6.0.4 Architecture Overview
 
-The following actors compose the system. All actors are spawned through
-`dactor::ActorRuntime` and communicate via `dactor::ActorRef::send()`
-(fire-and-forget). Broadcasting uses `dactor::ActorRuntime::broadcast_group()`.
+The following components compose the system. The core engine
+(`DistributedStateEngine`) is a pure state machine that returns
+`Vec<EngineAction>` — it performs no I/O. Actor spawning, messaging, and
+broadcasting are handled by the user's actor shell layer using `dactor`
+directly.
 
 ```mermaid
 graph TD
@@ -1250,10 +1239,10 @@ graph TD
 
 * Singleton per node. A plain `struct`, **not an actor** — it has no mailbox
   or message loop. Registration and lookup are direct method calls.
-* Provides `register()` and `lookup()` APIs.
-* On `register()`, validates that the `DistributedState` trait implementation is complete and stores the actor reference.
-* Generic over `R: dactor::ActorRuntime` — the concrete runtime is a type parameter,
-  not a hard-coded dependency.
+* Provides `register()`, `lookup()`, and `lookup_typed()` APIs.
+* On `register()`, stores the `AnyStateShard` trait object keyed by state name.
+* **Not generic** — `StateRegistry` is a plain struct with no type parameters.
+  It stores `dyn AnyStateShard` trait objects for type-erased access.
 
 #### Heterogeneous State Storage — Design Decision
 
@@ -1283,109 +1272,101 @@ pub trait AnyStateShard: Send + Sync + 'static {
     fn state_name(&self) -> &str;
 
     /// Notify this shard that a new node has joined the cluster.
-    /// Uses fire-and-forget send — no need for async.
     fn on_node_joined(&self, node_id: NodeId);
 
     /// Notify this shard that a node has left the cluster.
     fn on_node_left(&self, node_id: NodeId);
 
     /// Mark a peer's entry as stale (called by ChangeFeedAggregator).
-    fn on_mark_stale(&self, source: NodeId, new_age: u64);
+    fn on_mark_stale(&self, source: NodeId, incarnation: u64, age: u64);
 
     /// Return self as `&dyn Any` for downcasting to the concrete type.
     fn as_any(&self) -> &dyn std::any::Any;
 }
-
-/// Blanket implementation for all concrete StateShard actors.
-/// `R::Ref<StateShardMsg<S>>` is the runtime-provided actor reference type.
-impl<R: ActorRuntime, S: DistributedState> AnyStateShard for R::Ref<StateShardMsg<S>> {
-    fn state_name(&self) -> &str { S::name() }
-
-    fn on_node_joined(&self, node_id: NodeId) {
-        let _ = self.send(StateShardMsg::NodeJoined(node_id));
-    }
-
-    fn on_node_left(&self, node_id: NodeId) {
-        let _ = self.send(StateShardMsg::NodeLeft(node_id));
-    }
-
-    fn on_mark_stale(&self, source: NodeId, new_age: u64) {
-        let _ = self.send(StateShardMsg::MarkStale { source, new_age });
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any { self }
-}
 ```
+
+Users implement `AnyStateShard` for their actor shell types. For example,
+a ractor-backed implementation would wrap the actor reference and delegate
+the trait methods to fire-and-forget sends. This is application code — dstate
+does not provide a blanket implementation.
 
 The registry stores `HashMap<String, (TypeId, Box<dyn AnyStateShard>)>`:
 
 ```rust
 use std::any::TypeId;
 
-pub struct StateRegistry<R: ActorRuntime> {
-    runtime: R,
+pub struct StateRegistry {
     shards: HashMap<String, (TypeId, Box<dyn AnyStateShard>)>,
 }
 
-impl<R: ActorRuntime> StateRegistry<R> {
-    /// Register a new state type. Spawns the StateShard and SyncEngine actors.
-    ///
-    /// Returns `RegistryError::DuplicateName` if a different state type has
-    /// already been registered under the same `S::name()`.
-    pub fn register<S: DistributedState>(&mut self, config: StateConfig<S>) -> Result<(), RegistryError> {
-        let name = S::name().to_string();
-        let new_type_id = TypeId::of::<S>();
+impl StateRegistry {
+    pub fn new() -> Self {
+        Self { shards: HashMap::new() }
+    }
 
-        if let Some((existing_type_id, _)) = self.shards.get(&name) {
-            if *existing_type_id == new_type_id {
-                // Same type re-registered — idempotent, no-op.
-                return Ok(());
-            }
-            return Err(RegistryError::DuplicateName {
-                name,
-                existing_type: existing_type_id.clone(),
-                new_type: new_type_id,
-            });
+    /// Register a new state shard. The type parameter `S` must implement
+    /// `AnyStateShard`. Returns `RegistryError::DuplicateName` if a shard
+    /// with the same name is already registered.
+    pub fn register<S: AnyStateShard>(&mut self, shard: S) -> Result<(), RegistryError> {
+        let name = shard.state_name().to_string();
+        if self.shards.contains_key(&name) {
+            return Err(RegistryError::DuplicateName(name));
         }
-
-        let actor_ref = self.spawn_state_shard::<S>(config);
-        self.shards.insert(name, (new_type_id, Box::new(actor_ref)));
+        let type_id = TypeId::of::<S>();
+        self.shards.insert(name, (type_id, Box::new(shard)));
         Ok(())
     }
 
-    /// Look up a state shard by name, downcasting to the expected concrete type.
-    /// Returns an error if the state is not registered or the type does not match.
-    pub fn lookup<S: DistributedState>(&self) -> Result<&R::Ref<StateShardMsg<S>>, RegistryError> {
-        let (_, entry) = self.shards
-            .get(S::name())
-            .ok_or_else(|| RegistryError::StateNotRegistered {
-                name: S::name().to_string(),
-            })?;
+    /// Look up a state shard by name (type-erased).
+    pub fn lookup(&self, name: &str) -> Result<&dyn AnyStateShard, RegistryError> {
+        self.shards
+            .get(name)
+            .map(|(_, shard)| shard.as_ref())
+            .ok_or_else(|| RegistryError::StateNotRegistered(name.to_string()))
+    }
 
-        entry
+    /// Look up a shard by name and downcast to a concrete type `T`.
+    /// Returns `Err(TypeMismatch)` if the registered `TypeId` doesn't match.
+    pub fn lookup_typed<T: AnyStateShard + 'static>(&self, name: &str) -> Result<&T, RegistryError> {
+        let (registered_tid, shard) = self.shards
+            .get(name)
+            .ok_or_else(|| RegistryError::StateNotRegistered(name.to_string()))?;
+
+        let requested_tid = TypeId::of::<T>();
+        if *registered_tid != requested_tid {
+            return Err(RegistryError::TypeMismatch {
+                name: name.to_string(),
+                expected: std::any::type_name::<T>(),
+                actual: "different type",
+            });
+        }
+
+        shard
             .as_any()
-            .downcast_ref::<R::Ref<StateShardMsg<S>>>()
+            .downcast_ref::<T>()
             .ok_or_else(|| RegistryError::TypeMismatch {
-                name: S::name().to_string(),
+                name: name.to_string(),
+                expected: std::any::type_name::<T>(),
+                actual: "downcast failed",
             })
     }
 
     /// Broadcast a cluster event to all registered shards (no downcasting needed).
     pub fn broadcast_node_joined(&self, node_id: NodeId) {
         for (_, shard) in self.shards.values() {
-            shard.on_node_joined(node_id);
+            shard.on_node_joined(node_id.clone());
         }
     }
 
     pub fn broadcast_node_left(&self, node_id: NodeId) {
         for (_, shard) in self.shards.values() {
-            shard.on_node_left(node_id);
+            shard.on_node_left(node_id.clone());
         }
     }
 }
 ```
 
-Callers use `lookup::<MyState>()` for typed query/mutate access, while the registry internally uses the trait interface for cluster-wide broadcasts.
+Callers use `lookup_typed::<T>(name)` for typed query/mutate access, while the registry internally uses the `AnyStateShard` trait interface for cluster-wide broadcasts.
 
 ### 6.2 StateShard
 
@@ -1732,10 +1713,9 @@ enum ChangeFeedMsg {
 #### State
 
 ```rust
-struct ChangeFeedAggregator<R: ActorRuntime> {
+struct ChangeFeedAggregator {
     node_id: NodeId,
     batch_interval: Duration,
-    runtime: R,
 
     /// Pending notifications since last flush.
     /// Key: (state_name, source_node) → latest (incarnation, age).
@@ -1744,7 +1724,7 @@ struct ChangeFeedAggregator<R: ActorRuntime> {
     pending: HashMap<(String, NodeId), (u64, u64)>,
 
     /// Reference to the StateRegistry for routing inbound notifications.
-    registry: Arc<StateRegistry<R>>,
+    registry: Arc<StateRegistry>,
 }
 ```
 
@@ -1828,11 +1808,11 @@ sequenceDiagram
 ### 6.6 Timer-Driven Work
 
 Several system behaviors are driven by recurring or one-shot timers rather than
-external events. All timers are implemented via the `ActorRuntime`'s
-`send_interval` (recurring) or `send_after` (one-shot) methods, which deliver
-timer messages through the owning actor's mailbox. This guarantees timer
-handlers are serialized with all other messages — no extra synchronization is
-needed.
+external events. All timers are implemented via `dactor::TimerHandle` (re-exported
+by dstate). The user's actor shell uses dactor's `send_interval` (recurring)
+or `send_after` (one-shot) methods to deliver timer messages through the owning
+actor's mailbox. This guarantees timer handlers are serialized with all other
+messages — no extra synchronization is needed.
 
 #### Timer Inventory
 
@@ -3182,14 +3162,14 @@ Each log entry includes:
 Example log output:
 
 ```
-WARN distributed_state::sync_engine{state="node_resource" peer=NodeId(3)}:
+WARN distributed_state::sync_engine{state="node_resource" peer=NodeId("3")}:
      sync failed, attempt 5, last_error="connection timed out",
      local_age=142, remote_age=158, gap=16
 
-INFO distributed_state::sync_engine{state="node_resource" peer=NodeId(2)}:
+INFO distributed_state::sync_engine{state="node_resource" peer=NodeId("2")}:
      delta pushed, urgency=Immediate, age 200→201, latency_ms=3
 
-DEBUG distributed_state::sync_engine{state="node_resource" peer=NodeId(1)}:
+DEBUG distributed_state::sync_engine{state="node_resource" peer=NodeId("1")}:
      delta suppressed, urgency=Suppress, age 201→202,
      suppressed_count=4, total_mutations=202
 ```
@@ -3783,7 +3763,7 @@ async fn mutation_propagates_to_peers() {
     cluster.settle().await;
 
     let value = cluster.query::<MyState, _>(1, Duration::from_secs(5), |map| {
-        map.get(&NodeId(0)).unwrap().value.counter
+        map.get(&NodeId("0".to_string())).unwrap().value.counter
     }).await.unwrap();
     assert_eq!(value, 42);
 }
@@ -3800,7 +3780,7 @@ async fn crash_restart_propagates_via_new_incarnation() {
 
     // Peer accepts age=1 because incarnation is higher.
     let value = cluster.query::<MyState, _>(1, Duration::from_secs(5), |map| {
-        map.get(&NodeId(0)).unwrap().value.counter
+        map.get(&NodeId("0".to_string())).unwrap().value.counter
     }).await.unwrap();
     assert_eq!(value, 1);
 }
@@ -3813,7 +3793,7 @@ async fn crash_restart_propagates_via_new_incarnation() {
 | Never call `Instant::now()` or `SystemTime::now()` directly | Use injected `Clock` so tests control time |
 | Core logic in `ShardCore`, actor in thin shell | Unit test without async runtime or actor spawning |
 | All I/O behind traits (`StatePersistence`, transport) | Swap in-memory or failing doubles in tests |
-| Deterministic node IDs in tests (`NodeId(0)`, `NodeId(1)`, …) | Reproducible assertions, no random UUIDs |
+| Deterministic node IDs in tests (`NodeId("0".to_string())`, `NodeId("1".to_string())`, …) | Reproducible assertions, no random UUIDs |
 | `TestCluster::settle()` drains all in-flight messages | Eliminates flaky timing-dependent assertions |
 | No global mutable state (e.g., no `lazy_static` registries) | Tests run in parallel without interference |
 
