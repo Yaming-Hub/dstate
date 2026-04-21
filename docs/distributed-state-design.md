@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This document describes the detailed design of the **distributed state** crate, a library that replicates application state across cluster nodes so that request-serving decisions can be made locally, avoiding multi-hop latencies inherent in pure actor-based architectures. The crate is **actor-framework agnostic** — it defines abstract runtime traits (§6.0) and delegates to a concrete provider (e.g., [ractor](https://github.com/slawlor/ractor), [kameo](https://github.com/tqwewe/kameo), actix) selected via cargo features.
+This document describes the detailed design of the **distributed state** crate, a library that replicates application state across cluster nodes so that request-serving decisions can be made locally, avoiding multi-hop latencies inherent in pure actor-based architectures. The crate delegates actor runtime concerns to the [**dactor**](https://crates.io/crates/dactor) crate — an abstracted actor framework that provides a unified API over [ractor](https://github.com/slawlor/ractor), [kameo](https://github.com/tqwewe/kameo), and [coerce](https://github.com/leonhardtdavid/coerce). Users select their preferred backend via `dactor` feature flags; `dstate` itself contains no framework-specific code.
 
 ### Core Concept
 
@@ -945,268 +945,173 @@ When evolving a state's serialization format across versions:
 
 ## 6. Actor Architecture
 
-The crate is designed to work with **any** distributed actor framework that
-provides the five capabilities listed below. The concrete framework is selected
-at compile time via a cargo feature flag (see §6.0.2). All internal code
-programs against the abstract `ActorRuntime` trait — never against a specific
-framework's API directly.
+The crate delegates all actor runtime concerns to the
+[**dactor**](https://crates.io/crates/dactor) crate — an abstracted actor
+framework that provides a unified API over ractor, kameo, and coerce. Users
+select their preferred backend via `dactor` feature flags. All `dstate`
+internal code programs against `dactor` traits directly — there are no
+dstate-specific runtime abstractions or adapter crates.
 
-### 6.0 Actor Runtime Abstraction
+### 6.0 Actor Runtime — dactor Integration
 
 The distributed state crate requires exactly five capabilities from the
-underlying actor framework. These are captured as Rust traits so that
-providers can be swapped without changing any business logic.
+underlying actor framework. All five are provided by `dactor`'s trait
+hierarchy:
 
 ```mermaid
 graph TD
-    DS["distributed-state crate"]
-    DS -->|"programs against"| RT["trait ActorRuntime<br/>(includes group ops)"]
-    DS -->|"programs against"| AR["trait ActorRef"]
-    DS -->|"programs against"| CE["trait ClusterEvents"]
-    DS -->|"programs against"| TH["trait TimerHandle"]
+    DS["dstate crate"]
+    DS -->|"uses"| DA["dactor crate<br/>(ActorRuntime, ActorRef,<br/>ClusterEvents, TimerHandle)"]
 
-    subgraph "Compile-time provider (cargo feature)"
-        Ractor["ractor provider"]
-        Kameo["kameo provider"]
-        Actix["actix provider"]
-        Custom["custom provider"]
+    subgraph "dactor backends (cargo feature)"
+        Ractor["ractor backend"]
+        Kameo["kameo backend"]
+        Coerce["coerce backend"]
     end
 
-    RT -.->|"impl"| Ractor
-    RT -.->|"impl"| Kameo
-    RT -.->|"impl"| Actix
-    RT -.->|"impl"| Custom
+    DA -.->|"feature = ractor"| Ractor
+    DA -.->|"feature = kameo"| Kameo
+    DA -.->|"feature = coerce"| Coerce
 ```
 
 #### 6.0.1 Required Capabilities
 
-| # | Capability | Why the crate needs it | Trait |
+| # | Capability | Why the crate needs it | dactor Trait |
 |---|---|---|---|
-| 1 | **Single-threaded actor execution** | StateShard and SyncEngine process messages one at a time — no locks needed for state mutation or view-map swaps. | `ActorRuntime` |
-| 2 | **Remote actor messaging** | SyncEngine sends snapshots/deltas to peer SyncEngines on other nodes. Fire-and-forget (`send`) is the primary pattern; request-reply is framework-specific and handled at the adapter layer. | `ActorRef<M>` |
-| 3 | **Actor registration / discovery** | The StateRegistry must look up StateShard actors by name. Peer SyncEngines must discover each other across nodes. | `ActorRuntime::get_group_members` |
-| 4 | **Cluster node join/leave events** | ClusterMembership listener must be notified when nodes join or leave so it can propagate events to all StateShards. | `ClusterEvents` |
-| 5 | **Message broadcasting** | SyncEngine broadcasts snapshots/deltas to all peers of the same state type. ChangeFeedAggregator broadcasts batched notifications to all peer aggregators. | `ActorRuntime::broadcast_group` |
+| 1 | **Single-threaded actor execution** | StateShard and SyncEngine process messages one at a time — no locks needed for state mutation or view-map swaps. | `dactor::ActorRuntime` |
+| 2 | **Remote actor messaging** | SyncEngine sends snapshots/deltas to peer SyncEngines on other nodes. Fire-and-forget (`send`) is the primary pattern; request-reply is framework-specific and handled at the dactor layer. | `dactor::ActorRef<M>` |
+| 3 | **Actor registration / discovery** | The StateRegistry must look up StateShard actors by name. Peer SyncEngines must discover each other across nodes. | `dactor::ActorRuntime::get_group_members` |
+| 4 | **Cluster node join/leave events** | ClusterMembership listener must be notified when nodes join or leave so it can propagate events to all StateShards. | `dactor::ClusterEvents` |
+| 5 | **Message broadcasting** | SyncEngine broadcasts snapshots/deltas to all peers of the same state type. ChangeFeedAggregator broadcasts batched notifications to all peer aggregators. | `dactor::ActorRuntime::broadcast_group` |
 
-#### 6.0.2 Abstract Trait Definitions
+#### 6.0.2 Trait Definitions (from dactor)
+
+`dstate` imports these traits from the `dactor` crate. The definitions below
+are reproduced for reference — see the `dactor` documentation for the
+authoritative versions.
 
 ```rust
-use std::future::Future;
-use std::time::Duration;
+// All traits are defined and implemented in the `dactor` crate.
+// dstate uses them via `use dactor::{ActorRuntime, ActorRef, ...};`
 
 /// A handle to a running actor that can receive messages of type `M`.
-/// This is the primary way actors communicate — by sending messages
-/// through an `ActorRef`.
-///
-/// Implementations must guarantee:
-/// - Messages are delivered in FIFO order to the actor's handler.
-/// - The actor processes one message at a time (single-threaded).
 pub trait ActorRef<M: Send + 'static>: Clone + Send + Sync + 'static {
-    /// Fire-and-forget: enqueue a message in the actor's mailbox.
-    /// Returns immediately; does not wait for the message to be processed.
     fn send(&self, msg: M) -> Result<(), ActorSendError>;
-
-    /// Request-reply: send a message and wait for a response.
-    /// Only fire-and-forget delivery is part of this trait.
-    /// Request-reply patterns are framework-specific and should be
-    /// handled at the adapter layer.
-    fn send(&self, msg: M) -> Result<(), ActorSendError>;
-}
-
-/// Errors from fire-and-forget sends.
-#[derive(Debug)]
-pub enum ActorSendError {
-    /// The actor has stopped or its mailbox is full.
-    ActorUnavailable,
-}
-
-/// Opaque handle returned by `ClusterEvents::subscribe`, used to
-/// cancel a subscription via `ClusterEvents::unsubscribe`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SubscriptionId(pub(crate) u64);
-
-#[derive(Debug)]
-pub enum GroupError {
-    GroupNotFound,
-    NetworkError(String),
 }
 
 /// Subscription to cluster-level node membership events.
-/// The distributed state crate subscribes once at startup and
-/// routes events to all registered StateShards via the StateRegistry.
 pub trait ClusterEvents: Send + Sync + 'static {
-    /// Subscribe to cluster membership changes. Returns a handle
-    /// for later unsubscription.
     fn subscribe(
         &self,
         on_event: Box<dyn Fn(ClusterEvent) + Send + Sync>,
     ) -> Result<SubscriptionId, ClusterError>;
-
-    /// Remove a previously registered subscription. Idempotent.
     fn unsubscribe(&self, id: SubscriptionId) -> Result<(), ClusterError>;
 }
 
-pub enum ClusterEvent {
-    NodeJoined(NodeId),
-    NodeLeft(NodeId),
-}
-
-#[derive(Debug)]
-pub enum ClusterError {
-    AlreadySubscribed,
-    ConnectionFailed(String),
-}
-
 /// Timer handle returned by the runtime's scheduling methods.
-/// Dropping the handle cancels the timer.
 pub trait TimerHandle: Send + 'static {
-    /// Cancel the timer. After this call, the timer message will
-    /// not be delivered. Idempotent — cancelling an already-fired
-    /// or already-cancelled timer is a no-op.
     fn cancel(self);
 }
 
-/// The top-level runtime abstraction. Provides actor lifecycle,
-/// timer scheduling, and processing group management. One instance
-/// per node.
-///
-/// Processing group methods are part of this trait (rather than a
-/// separate trait) so that all group operations use the same
-/// `Self::Ref<M>` type family without requiring cross-trait GAT
-/// equality constraints.
+/// The top-level runtime abstraction. One instance per node.
 pub trait ActorRuntime: Send + Sync + 'static {
     type Ref<M: Send + 'static>: ActorRef<M>;
     type Events: ClusterEvents;
     type Timer: TimerHandle;
 
-    /// Spawn a new actor with the given handler. Returns a reference
-    /// that can be used to send messages to the actor.
-    ///
-    /// The handler closure is invoked for each message, one at a time
-    /// (single-threaded guarantee).
-    fn spawn<M, H, S>(
-        &self,
-        name: &str,
-        initial_state: S,
-        handler: H,
-    ) -> Self::Ref<M>
+    fn spawn<M, H>(&self, name: &str, handler: H) -> Self::Ref<M>
     where
         M: Send + 'static,
-        S: Send + 'static,
-        H: FnMut(&mut S, M) -> BoxFuture<'_, ()> + Send + 'static;
+        H: FnMut(M) + Send + 'static;
 
-    /// Schedule a recurring timer that sends `msg` to `target` every
-    /// `interval`. The first tick fires after `interval` has elapsed.
     fn send_interval<M: Clone + Send + 'static>(
-        &self,
-        target: &Self::Ref<M>,
-        interval: Duration,
-        msg: M,
+        &self, target: &Self::Ref<M>, interval: Duration, msg: M,
     ) -> Self::Timer;
 
-    /// Schedule a one-shot timer that sends `msg` to `target` after
-    /// `delay`.
     fn send_after<M: Send + 'static>(
-        &self,
-        target: &Self::Ref<M>,
-        delay: Duration,
-        msg: M,
+        &self, target: &Self::Ref<M>, delay: Duration, msg: M,
     ) -> Self::Timer;
 
-    /// Add an actor to a named processing group.
     fn join_group<M: Send + 'static>(
-        &self,
-        group_name: &str,
-        actor: &Self::Ref<M>,
+        &self, group_name: &str, actor: &Self::Ref<M>,
     ) -> Result<(), GroupError>;
 
-    /// Remove an actor from a named processing group.
     fn leave_group<M: Send + 'static>(
-        &self,
-        group_name: &str,
-        actor: &Self::Ref<M>,
+        &self, group_name: &str, actor: &Self::Ref<M>,
     ) -> Result<(), GroupError>;
 
-    /// Broadcast a message to all members of a named group.
     fn broadcast_group<M: Clone + Send + 'static>(
-        &self,
-        group_name: &str,
-        msg: M,
+        &self, group_name: &str, msg: M,
     ) -> Result<(), GroupError>;
 
-    /// Get current members of the group (for point-to-point sends).
     fn get_group_members<M: Send + 'static>(
-        &self,
-        group_name: &str,
+        &self, group_name: &str,
     ) -> Result<Vec<Self::Ref<M>>, GroupError>;
 
-    /// Access the cluster events facility.
     fn cluster_events(&self) -> &Self::Events;
 }
 ```
 
 #### 6.0.3 Crate Architecture
 
-Rather than using cargo features to select the actor framework at compile time
-within a single crate, the design uses a **multi-crate** approach. This keeps
-the core crate dependency-free from any actor framework and makes it easy for
-third parties to add new adapters without modifying the core.
+Previous versions of dstate used a **multi-crate adapter pattern** with
+separate adapter crates (`dstate-ractor`, `dstate-kameo`) that each
+implemented the runtime traits for a specific actor framework. This approach
+required maintaining N adapter crates for N frameworks, with significant
+code duplication.
+
+Starting in v1.0, dstate delegates the runtime abstraction to the `dactor`
+crate, which already provides a unified trait layer over multiple backends.
+This eliminates the adapter crates entirely:
 
 ```mermaid
 graph TD
-    subgraph "Core (no framework dependency)"
-        Core["dstate<br/>(traits, state model, pure logic)"]
-    end
-
-    subgraph "Adapter Crates (one per framework)"
-        Ractor["dstate-ractor<br/>depends on: dstate, ractor, ractor_cluster"]
-        Kameo["dstate-kameo<br/>depends on: dstate, kameo"]
-        Actix["dstate-actix<br/>depends on: dstate, actix, actix-broker"]
-    end
-
     subgraph "Application"
-        App["my-app<br/>depends on: dstate-ractor"]
+        App["my-app<br/>depends on: dstate, dactor"]
     end
 
-    Core --> Ractor
-    Core --> Kameo
-    Core --> Actix
-    Ractor --> App
+    subgraph "Core (no framework dependency)"
+        Core["dstate<br/>(state model, replication logic)<br/>depends on: dactor"]
+    end
+
+    subgraph "Actor Abstraction"
+        Dactor["dactor<br/>(unified actor traits + backend impls)"]
+    end
+
+    App --> Core
+    App --> Dactor
+    Core --> Dactor
 ```
 
-**Crate series:**
+**Crate series (v1.0):**
 
 | Crate | Role | Dependencies |
 |---|---|---|
-| `dstate` | Core library. Defines all public traits (`DistributedState`, `DeltaDistributedState`, `ActorRuntime`, `ActorRef`, `ClusterEvents`, `TimerHandle`, `StatePersistence`, `Clock`), data types (`StateObject`, `StateViewObject`, `SyncMessage`, `ChangeNotification`, etc.), pure logic (`ShardCore`), error types, and configuration structs. **No actor framework dependency.** Processing group operations are part of `ActorRuntime`. | `arc-swap`, `tokio` (time only) |
-| `dstate-ractor` | Ractor adapter. Implements `ActorRuntime` for ractor, wires `StateShard`/`SyncEngine`/`ChangeFeedAggregator` as ractor actors, and provides a ready-to-use `StateRegistry<RactorRuntime>`. | `dstate`, `ractor`, `ractor_cluster` |
-| `dstate-kameo` | Kameo adapter. Same role as `dstate-ractor` but for the kameo framework. | `dstate`, `kameo` |
-| `dstate-actix` | Actix adapter. Same role, targeting actix + a custom cluster messaging layer. | `dstate`, `actix`, `actix-broker` |
+| `dstate` | Core library. Defines state traits (`DistributedState`, `DeltaDistributedState`), persistence traits (`StatePersistence`), clock abstraction (`Clock`), data types (`StateObject`, `StateViewObject`, `SyncMessage`, etc.), pure logic (`ShardCore`, `SyncLogic`, etc.), error types, and configuration structs. Re-exports runtime traits from `dactor`. | `dactor`, `arc-swap`, `tokio` (time only) |
+| `dactor` | Actor runtime abstraction. Defines `ActorRuntime`, `ActorRef`, `ClusterEvents`, `TimerHandle` traits with concrete implementations for ractor, kameo, and coerce (selected via cargo features). | `ractor` or `kameo` or `coerce` (feature-gated) |
 
-**Application authors depend only on the adapter crate** for their chosen
-framework. The adapter re-exports everything from `dstate` so there is no
-need to depend on both:
+**Removed crates (previously in v0.1):**
+
+| Removed Crate | Reason |
+|---|---|
+| `dstate-ractor` | Runtime abstraction moved to `dactor` |
+| `dstate-kameo` | Runtime abstraction moved to `dactor` |
+| `dstate-e2e` | Tested adapter crates; no longer needed |
+
+**Application authors depend on `dstate` + `dactor`** with their chosen
+backend feature:
 
 ```toml
-# Application Cargo.toml — only one dependency needed
+# Application Cargo.toml
 [dependencies]
-dstate-ractor = "0.1"
+dstate = "1.0"
+dactor = { version = "0.1", features = ["ractor"] }  # or "kameo" or "coerce"
 ```
 
 ```rust
-// Application code — imports come through the adapter crate
-use dstate_ractor::{StateRegistry, StateConfig, SyncStrategy};
-use dstate_ractor::{DistributedState, DeltaDistributedState};
-```
-
-**Third-party adapters** can be created independently by depending on `dstate`
-and implementing the runtime traits:
-
-```toml
-# dstate-my-framework/Cargo.toml
-[dependencies]
-dstate       = "0.1"
-my-framework = "1.0"
+// Application code — runtime traits come through dactor
+use dstate::{DistributedState, DeltaDistributedState, StateConfig, SyncStrategy};
+use dactor::{ActorRuntime, ActorRef};
 ```
 
 #### Core Crate (`dstate`) Module Layout
@@ -1214,14 +1119,12 @@ my-framework = "1.0"
 ```
 dstate/
 ├── src/
-│   ├── lib.rs              // Public API re-exports
+│   ├── lib.rs              // Public API re-exports (re-exports dactor runtime traits)
 │   ├── traits/
 │   │   ├── mod.rs
 │   │   ├── state.rs        // DistributedState, DeltaDistributedState traits
-│   │   ├── runtime.rs      // ActorRuntime (incl. group ops), ActorRef,
-│   │   │                   //   ClusterEvents, TimerHandle, SubscriptionId
 │   │   ├── persistence.rs  // StatePersistence trait (saves StateObject<S>)
-│   │   └── clock.rs        // Clock trait, SystemClock, TestClock
+│   │   └── clock.rs        // Clock trait, SystemClock
 │   ├── types/
 │   │   ├── mod.rs
 │   │   ├── envelope.rs     // StateObject, StateViewObject
@@ -1233,48 +1136,50 @@ dstate/
 │   ├── core/
 │   │   ├── mod.rs
 │   │   ├── shard_core.rs   // ShardCore — pure state machine logic
-│   │   │                   //   (mutation, age comparison, view-map ops,
-│   │   │                   //    staleness detection, incarnation ordering)
 │   │   ├── sync_logic.rs   // Urgency dispatch, delta accumulation,
 │   │   │                   //   broadcast/pull decision logic
 │   │   ├── change_feed.rs  // ChangeFeed aggregation logic
-│   │   │                   //   (dedup, batching, pending map)
 │   │   └── versioning.rs   // Wire version comparison, mismatch policy
 │   ├── messages/
 │   │   ├── mod.rs
 │   │   ├── shard_msg.rs    // StateShardMsg, SimpleShardMsg, DeltaShardMsg
 │   │   ├── sync_msg.rs     // SyncEngineMsg
 │   │   └── feed_msg.rs     // ChangeFeedMsg
-│   ├── registry.rs         // StateRegistry<R: ActorRuntime>, AnyStateShard trait
+│   ├── registry.rs         // StateRegistry<R: dactor::ActorRuntime>, AnyStateShard trait
 │   └── test_support/
 │       ├── mod.rs
 │       ├── test_clock.rs   // TestClock implementation
-│       ├── test_persist.rs // InMemoryPersistence, FailingPersistence
-│       └── test_cluster.rs // TestCluster harness (uses a TestRuntime)
+│       └── test_persist.rs // InMemoryPersistence, FailingPersistence
 ```
 
+**Key change from v0.1:** The `traits/runtime.rs` module is **removed**. All
+runtime traits (`ActorRuntime`, `ActorRef`, `ClusterEvents`, `TimerHandle`)
+are now imported from `dactor`. The `test_support/` module uses dactor's own
+test runtime (or a dstate-local `TestRuntime` that implements dactor's traits).
+
 **Key design principle:** The `core/` module contains **all pure logic** with
-no dependency on any actor runtime. The adapter crate's job is to wire these
-pure structs into framework-specific actor shells. This keeps the core
-unit-testable without any framework overhead.
+no dependency on any actor runtime. The `dactor`-backed runtime wires these
+pure structs into actor shells. This keeps the core unit-testable without
+any framework overhead.
 
 #### Public API Surface — Least Exposure Principle
 
 The `dstate` core crate follows the **least exposure** principle: only types
-and traits that downstream consumers (application code or adapter crates)
-need are publicly exported. Internal implementation details are kept
-`pub(crate)` or private.
+and traits that downstream consumers need are publicly exported.
 
 **lib.rs re-exports — the only public surface:**
 
 ```rust
 // ── Traits (what users implement) ───────────────────────────────
 pub use traits::state::{DistributedState, DeltaDistributedState, SyncUrgency};
-pub use traits::runtime::{
-    ActorRuntime, ActorRef, ClusterEvents, TimerHandle, ClusterEvent, SubscriptionId,
-};
 pub use traits::persistence::{StatePersistence, PersistError};
 pub use traits::clock::{Clock, SystemClock};
+
+// ── Runtime traits (re-exported from dactor) ────────────────────
+pub use dactor::{
+    ActorRuntime, ActorRef, ClusterEvents, TimerHandle,
+    ClusterEvent, SubscriptionId, ActorSendError, GroupError, ClusterError,
+};
 
 // ── Types (what users construct / receive) ──────────────────────
 pub use types::envelope::{StateObject, StateViewObject};
@@ -1283,13 +1188,10 @@ pub use types::node::{NodeId, VersionMismatchPolicy};
 pub use types::errors::{
     RegistryError, QueryError, MutationError, DeserializeError,
 };
-pub use traits::runtime::{
-    ActorSendError, GroupError, ClusterError,
-};
 pub use types::sync_message::{SyncMessage, ChangeNotification, BatchedChangeFeed};
 
 // ── Test support (feature-gated or cfg(test)) ───────────────────
-pub mod test_support;  // TestClock, InMemoryPersistence, FailingPersistence, TestRuntime
+pub mod test_support;  // TestClock, InMemoryPersistence, FailingPersistence
 ```
 
 **Visibility rules by module:**
@@ -1298,296 +1200,25 @@ pub mod test_support;  // TestClock, InMemoryPersistence, FailingPersistence, Te
 |---|---|---|
 | `traits/` | Items re-exported via `lib.rs` | Traits are the contract — users implement or consume them |
 | `types/` | Items re-exported via `lib.rs` | Users construct configs, match on errors, send messages |
-| `core/` | `pub(crate)` | Pure logic — only adapter crates and `registry.rs` use it internally. Not exposed to application code. |
-| `messages/` | `pub(crate)` | Message enums are internal plumbing between actors. Adapter crates import them to wire actors but application code never touches them. |
+| `core/` | `pub(crate)` | Pure logic — only `registry.rs` uses it internally. Not exposed to application code. |
+| `messages/` | `pub(crate)` | Message enums are internal plumbing between actors. Application code never touches them. |
 | `registry.rs` | `StateRegistry` re-exported via `lib.rs` | The registry is the user-facing entry point for registration |
-| `test_support/` | `pub` (entire module) | Must be accessible to adapter crates for conformance testing and to application tests for `TestCluster` |
-
-**What is NOT public:**
-
-- `core::shard_core::ShardCore` — internal state machine, only used by
-  adapter actor shells
-- `core::sync_logic`, `core::change_feed`, `core::versioning` — internal
-  decision logic
-- `messages::shard_msg`, `messages::sync_msg`, `messages::feed_msg` —
-  internal message envelopes between actors
-- Individual `traits/` and `types/` submodule paths (e.g.,
-  `dstate::traits::state::DistributedState` works but the preferred import
-  is `dstate::DistributedState`)
-
-**Adapter crates** (e.g., `dstate-ractor`) re-export the entire public API
-from `dstate` so that application code only needs a single dependency:
-
-```rust
-// In dstate-ractor/src/lib.rs:
-pub use dstate::*;
-pub use runtime::RactorRuntime;
-pub use actors::{StateShardActor, SyncEngineActor, ChangeFeedActor};
-```
+| `test_support/` | `pub` (entire module) | Must be accessible to application tests for `TestCluster` |
 
 | Module | Contains | Depends on actor runtime? |
 |---|---|---|
-| `traits/` | All public trait definitions | ❌ (defines `ActorRuntime` but doesn't implement it) |
+| `traits/` | State, persistence, clock trait definitions | ❌ |
 | `types/` | Data structs, enums, error types | ❌ |
 | `core/` | `ShardCore`, sync logic, change feed logic | ❌ (pure functions and state machines) |
 | `messages/` | Message enum definitions | ❌ (just data types) |
-| `registry.rs` | `StateRegistry<R>` | ✅ Generic over `R: ActorRuntime` (uses `R::Ref`, `R::spawn`) |
-| `test_support/` | Test doubles and harness | ❌ (uses a `TestRuntime` that implements `ActorRuntime` in-process) |
+| `registry.rs` | `StateRegistry<R>` | ✅ Generic over `R: dactor::ActorRuntime` |
+| `test_support/` | Test doubles and harness | Uses dactor's test runtime or local impl of dactor traits |
 
-#### Adapter Crate (`dstate-ractor`) Module Layout
+### 6.0.4 Architecture Overview
 
-```
-dstate-ractor/
-├── src/
-│   ├── lib.rs              // Re-exports dstate::* + ractor-specific types
-│   ├── runtime.rs          // RactorRuntime: impl ActorRuntime
-│   ├── actors/
-│   │   ├── mod.rs
-│   │   ├── shard_actor.rs  // impl Actor for StateShardActor<S>
-│   │   │                   //   (wraps ShardCore, delegates to pure logic)
-│   │   ├── sync_actor.rs   // impl Actor for SyncEngineActor<S>
-│   │   │                   //   (wraps sync_logic, uses pg::broadcast)
-│   │   └── feed_actor.rs   // impl Actor for ChangeFeedActor
-│   │                       //   (wraps change_feed logic, uses pg::broadcast)
-│   └── cluster.rs          // RactorClusterEvents: impl ClusterEvents
-│                           //   (subscribes to ractor_cluster membership)
-```
-
-#### 6.0.4 Ractor Provider (Reference Implementation)
-
-The `dstate-ractor` adapter crate maps the abstract traits to ractor's
-concrete APIs:
-
-| Abstract Trait | Ractor Implementation |
-|---|---|
-| `ActorRef<M>::send()` | `ractor::ActorRef::cast()` |
-| `ActorRuntime::join_group()` | `ractor::pg::join(group, actor_ref)` |
-| `ActorRuntime::leave_group()` | `ractor::pg::leave(group, actor_ref)` |
-| `ActorRuntime::broadcast_group()` | `ractor::pg::broadcast(group, msg)` |
-| `ActorRuntime::get_group_members()` | `ractor::pg::get_members(group)` |
-| `ClusterEvents::subscribe()` | Subscribe to `ractor_cluster` membership events |
-| `ClusterEvents::unsubscribe()` | Remove membership event callback |
-| `ActorRuntime::spawn()` | `ractor::Actor::spawn()` wrapping handler in `impl Actor` |
-| `ActorRuntime::send_interval()` | `ractor::Actor::send_interval()` |
-| `ActorRuntime::send_after()` | `ractor::Actor::send_after()` |
-| `TimerHandle::cancel()` | Drop the `ractor::timer::SendAfterHandle` |
-
-```rust
-// In dstate-ractor/src/runtime.rs
-use dstate::{ActorRuntime, ActorRef, ClusterEvents, TimerHandle};
-
-pub struct RactorRuntime {
-    // Holds cluster connection state for ractor_cluster
-}
-
-impl ActorRuntime for RactorRuntime {
-    type Ref<M: Send + 'static> = ractor::ActorRef<M>;
-    type Events = RactorClusterEvents;
-    type Timer = RactorTimerHandle;
-
-    fn spawn<M, H, S>(
-        &self,
-        name: &str,
-        initial_state: S,
-        handler: H,
-    ) -> Self::Ref<M>
-    where
-        M: Send + 'static,
-        S: Send + 'static,
-        H: FnMut(&mut S, M) -> BoxFuture<'_, ()> + Send + 'static,
-    {
-        // Wraps the handler in a struct that implements ractor::Actor,
-        // then calls ractor::Actor::spawn(). The ractor Actor's
-        // handle() method delegates to the closure.
-        todo!("wrap handler in impl Actor and spawn")
-    }
-
-    fn send_interval<M: Clone + Send + 'static>(
-        &self,
-        target: &Self::Ref<M>,
-        interval: Duration,
-        msg: M,
-    ) -> Self::Timer {
-        let handle = target.send_interval(interval, move || msg.clone());
-        RactorTimerHandle(Some(handle))
-    }
-
-    // ... remaining methods map directly to ractor APIs
-}
-```
-
-#### 6.0.5 Kameo Provider
-
-[Kameo](https://github.com/tqwewe/kameo) (v0.19+) is a lightweight, fault-tolerant actor framework
-built on Tokio. It provides distributed actor communication via
-[libp2p](https://libp2p.io) and uses Kademlia DHT for actor registration
-and lookup — no centralized registry needed.
-
-**Key differences from ractor:**
-
-| Concern | Ractor | Kameo |
-|---|---|---|
-| **Messaging API** | `cast()` / `call()` | `tell()` / `ask()` |
-| **Actor definition** | `impl Actor for T` with `handle()` method | `#[derive(Actor)]` + `impl Message<M> for T` (one handler per message type) |
-| **Processing groups** | Built-in `pg` module (`pg::join`, `pg::broadcast`) | No built-in groups; use `PubSub<M>` actor from `kameo_actors` crate or manual actor registry |
-| **Cluster membership** | `ractor_cluster` with TCP transport + heartbeats | `ActorSwarm` with libp2p (Kademlia DHT, gossipsub, QUIC/TCP) |
-| **Remote actor refs** | Transparent via `ractor_cluster` | `RemoteActorRef<A>` with explicit `register()` / `lookup()` |
-| **Timer scheduling** | `send_interval()` / `send_after()` on `ActorRef` | `tokio::time::interval` + `tell()` in a spawned task |
-
-##### Adapter Crate (`dstate-kameo`) Module Layout
-
-```
-dstate-kameo/
-├── src/
-│   ├── lib.rs              // Re-exports dstate::* + kameo-specific types
-│   ├── runtime.rs          // KameoRuntime: impl ActorRuntime
-│   ├── actors/
-│   │   ├── mod.rs
-│   │   ├── shard_actor.rs  // impl Message<StateShardMsg<S>> for StateShardActor<S>
-│   │   │                   //   (wraps ShardCore, delegates to pure logic)
-│   │   ├── sync_actor.rs   // impl Message<SyncEngineMsg<S>> for SyncEngineActor<S>
-│   │   │                   //   (broadcasting via PubSub actor)
-│   │   └── feed_actor.rs   // impl Message<ChangeFeedMsg> for ChangeFeedActor
-│   │                       //   (wraps change_feed logic)
-│   ├── group.rs            // Group operations implemented inside
-│   │                       //   KameoRuntime using PubSub<M> actors
-│   └── cluster.rs          // KameoClusterEvents: impl ClusterEvents
-│                           //   (subscribes to ActorSwarm peer events)
-```
-
-##### Trait Mapping
-
-| Abstract Trait | Kameo Implementation |
-|---|---|
-| `ActorRef<M>::send()` | `kameo::ActorRef::tell()` |
-| `ActorRuntime::join_group()` | `pubsub_ref.tell(Subscribe::new(actor_ref.recipient()))` |
-| `ActorRuntime::leave_group()` | `pubsub_ref.tell(Unsubscribe::new(actor_ref.recipient()))` |
-| `ActorRuntime::broadcast_group()` | `pubsub_ref.tell(Publish::new(msg))` |
-| `ActorRuntime::get_group_members()` | Query internal `Vec<ActorRef>` on the `PubSub` actor |
-| `ClusterEvents::subscribe()` | Subscribe to `ActorSwarm` peer discovery/disconnect events |
-| `ClusterEvents::unsubscribe()` | Remove peer event callback |
-| `ActorRuntime::spawn()` | `A::spawn(initial_state)` with `#[derive(Actor)]` wrapper |
-| `ActorRuntime::send_interval()` | Spawn a `tokio::task` that calls `tell()` on an interval |
-| `ActorRuntime::send_after()` | `tokio::spawn(async { tokio::time::sleep(d).await; ref_.tell(msg) })` |
-| `TimerHandle::cancel()` | `tokio::task::JoinHandle::abort()` |
-
-##### Processing Group Strategy
-
-Kameo does not have a built-in processing group equivalent to ractor's `pg`
-module. The `dstate-kameo` adapter bridges this gap using **one `PubSub<M>`
-actor per group name**, managed internally by `KameoRuntime`:
-
-```rust
-use kameo::actor::Spawn;
-use kameo_actors::pubsub::{PubSub, Subscribe, Unsubscribe, Publish};
-
-pub struct KameoRuntime {
-    /// group_name → PubSub actor ref
-    groups: HashMap<String, kameo::ActorRef<PubSub<Vec<u8>>>>,
-    // ...
-}
-
-// Group operations are part of ActorRuntime — no separate ProcessingGroup trait.
-// KameoRuntime implements join_group/leave_group/broadcast_group/get_group_members
-// by delegating to the PubSub actors stored in self.groups.
-```
-
-For **distributed** broadcasting (cross-node), the `PubSub` actor is
-configured with libp2p's gossipsub protocol so that `Publish` messages
-propagate to subscribers on remote nodes. Each node's `ChangeFeedActor`
-and `SyncEngineActor` subscribe to their respective `PubSub` actor.
-
-##### Cluster Events via ActorSwarm
-
-Kameo uses `ActorSwarm` for cluster formation. The adapter subscribes to
-swarm events for node join/leave notifications:
-
-```rust
-use kameo::remote::ActorSwarm;
-
-pub struct KameoClusterEvents {
-    swarm: ActorSwarm,
-}
-
-impl ClusterEvents for KameoClusterEvents {
-    fn subscribe(
-        &self,
-        on_event: Box<dyn Fn(ClusterEvent) + Send + Sync>,
-    ) -> Result<(), ClusterError> {
-        // ActorSwarm emits peer connected/disconnected events.
-        // The adapter translates these to ClusterEvent::NodeJoined / NodeLeft.
-        self.swarm.on_peer_connected(move |peer_id| {
-            on_event(ClusterEvent::NodeJoined(NodeId::from(peer_id)));
-        });
-        self.swarm.on_peer_disconnected(move |peer_id| {
-            on_event(ClusterEvent::NodeLeft(NodeId::from(peer_id)));
-        });
-        Ok(())
-    }
-}
-```
-
-##### Timer Implementation
-
-Since kameo does not provide `send_interval` / `send_after` as built-in actor
-methods, the adapter implements timers as lightweight Tokio tasks:
-
-```rust
-pub struct KameoTimerHandle {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl TimerHandle for KameoTimerHandle {
-    fn cancel(self) {
-        self.handle.abort();
-    }
-}
-
-impl KameoRuntime {
-    fn send_interval<M: Clone + Send + 'static>(
-        &self,
-        target: &kameo::ActorRef<A>,
-        interval: Duration,
-        msg: M,
-    ) -> KameoTimerHandle
-    where
-        A: kameo::Actor + kameo::message::Message<M>,
-    {
-        let target = target.clone();
-        let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                if target.tell(msg.clone()).is_err() {
-                    break; // Actor stopped — exit timer loop
-                }
-            }
-        });
-        KameoTimerHandle { handle }
-    }
-}
-```
-
-Because timer messages are delivered via `tell()` into the actor's mailbox,
-they are serialized with all other messages — preserving the single-threaded
-guarantee required by the core design (§6.6).
-
-##### Dependencies
-
-```toml
-# dstate-kameo/Cargo.toml
-[dependencies]
-dstate       = { path = "../dstate" }
-kameo        = "0.19"
-kameo_actors = "0.19"   # for PubSub actor
-tokio        = { version = "1", features = ["time", "rt"] }
-```
-
-### 6.0.6 Architecture Overview
-
-The following actors compose the system. All actors are spawned through the
-`ActorRuntime` trait and communicate via `ActorRef::send()` (fire-and-forget).
-Broadcasting uses `ActorRuntime::broadcast_group()`.
+The following actors compose the system. All actors are spawned through
+`dactor::ActorRuntime` and communicate via `dactor::ActorRef::send()`
+(fire-and-forget). Broadcasting uses `dactor::ActorRuntime::broadcast_group()`.
 
 ```mermaid
 graph TD
@@ -1621,7 +1252,7 @@ graph TD
   or message loop. Registration and lookup are direct method calls.
 * Provides `register()` and `lookup()` APIs.
 * On `register()`, validates that the `DistributedState` trait implementation is complete and stores the actor reference.
-* Generic over `R: ActorRuntime` — the concrete runtime is a type parameter,
+* Generic over `R: dactor::ActorRuntime` — the concrete runtime is a type parameter,
   not a hard-coded dependency.
 
 #### Heterogeneous State Storage — Design Decision
@@ -4190,4 +3821,4 @@ async fn crash_restart_propagates_via_new_incarnation() {
 
 ## 16. Summary
 
-The distributed state crate provides a structured way to shard, replicate, and query application state across a distributed actor cluster. By keeping read-only replicas on every node and offering configurable synchronization strategies, it enables **local-first, low-latency decision-making** while accepting bounded staleness as a deliberate trade-off. The **actor runtime abstraction** (§6.0) decouples the crate from any specific framework — ractor, kameo, actix, or custom implementations can be swapped via cargo features without changing business logic. The trait-based design keeps the system extensible for diverse state types.
+The distributed state crate provides a structured way to shard, replicate, and query application state across a distributed actor cluster. By keeping read-only replicas on every node and offering configurable synchronization strategies, it enables **local-first, low-latency decision-making** while accepting bounded staleness as a deliberate trade-off. Actor runtime concerns are delegated to the **dactor** crate (§6.0), which provides a unified abstraction over ractor, kameo, and coerce — users select their preferred backend via dactor feature flags without changing any dstate business logic. The trait-based design keeps the system extensible for diverse state types.

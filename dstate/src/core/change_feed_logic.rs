@@ -125,7 +125,7 @@ impl ChangeFeedLogic {
             .collect();
 
         Some(BatchedChangeFeed {
-            source_node: self.node_id,
+            source_node: self.node_id.clone(),
             notifications,
         })
     }
@@ -152,7 +152,7 @@ impl ChangeFeedLogic {
         batch
             .notifications
             .iter()
-            .map(|n| (n.state_name.clone(), n.source_node, n.generation))
+            .map(|n| (n.state_name.clone(), n.source_node.clone(), n.generation))
             .collect()
     }
 }
@@ -168,15 +168,15 @@ mod tests {
     // CFA-01
     #[test]
     fn notify_dedup_keeps_highest() {
-        let mut logic = ChangeFeedLogic::new(NodeId(1));
+        let mut logic = ChangeFeedLogic::new(NodeId("1".to_string()));
 
-        logic.notify_change("counters".into(), NodeId(2), gen(1, 1));
-        logic.notify_change("counters".into(), NodeId(2), gen(1, 2));
-        logic.notify_change("counters".into(), NodeId(2), gen(1, 3));
+        logic.notify_change("counters".into(), NodeId("2".to_string()), gen(1, 1));
+        logic.notify_change("counters".into(), NodeId("2".to_string()), gen(1, 2));
+        logic.notify_change("counters".into(), NodeId("2".to_string()), gen(1, 3));
 
         assert_eq!(logic.pending_count(), 1);
         assert_eq!(
-            logic.pending[&("counters".to_string(), NodeId(2))],
+            logic.pending[&("counters".to_string(), NodeId("2".to_string()))],
             gen(1, 3),
         );
     }
@@ -184,20 +184,20 @@ mod tests {
     // CFA-02
     #[test]
     fn flush_sends_batched_feed() {
-        let mut logic = ChangeFeedLogic::new(NodeId(1));
+        let mut logic = ChangeFeedLogic::new(NodeId("1".to_string()));
 
-        logic.notify_change("counters".into(), NodeId(2), gen(1, 1));
-        logic.notify_change("sessions".into(), NodeId(3), gen(2, 5));
+        logic.notify_change("counters".into(), NodeId("2".to_string()), gen(1, 1));
+        logic.notify_change("sessions".into(), NodeId("3".to_string()), gen(2, 5));
 
         let batch = logic.flush().expect("should produce a batch");
-        assert_eq!(batch.source_node, NodeId(1));
+        assert_eq!(batch.source_node, NodeId("1".to_string()));
         assert_eq!(batch.notifications.len(), 2);
     }
 
     // CFA-03
     #[test]
     fn empty_pending_no_flush() {
-        let mut logic = ChangeFeedLogic::new(NodeId(1));
+        let mut logic = ChangeFeedLogic::new(NodeId("1".to_string()));
         assert!(logic.flush().is_none());
     }
 
@@ -205,28 +205,28 @@ mod tests {
     #[test]
     fn self_message_filtered() {
         let batch = BatchedChangeFeed {
-            source_node: NodeId(1),
+            source_node: NodeId("1".to_string()),
             notifications: vec![ChangeNotification {
                 state_name: "counters".into(),
-                source_node: NodeId(1),
+                source_node: NodeId("1".to_string()),
                 generation: gen(1, 1),
             }],
         };
 
-        let routed = ChangeFeedLogic::route_inbound_batch(&batch, NodeId(1));
+        let routed = ChangeFeedLogic::route_inbound_batch(&batch, NodeId("1".to_string()));
         assert!(routed.is_empty());
     }
 
     // CFA-06
     #[test]
     fn cross_state_batching() {
-        let mut logic = ChangeFeedLogic::new(NodeId(1));
+        let mut logic = ChangeFeedLogic::new(NodeId("1".to_string()));
 
-        logic.notify_change("counters".into(), NodeId(2), gen(1, 1));
-        logic.notify_change("sessions".into(), NodeId(2), gen(1, 1));
+        logic.notify_change("counters".into(), NodeId("2".to_string()), gen(1, 1));
+        logic.notify_change("sessions".into(), NodeId("2".to_string()), gen(1, 1));
 
         let batch = logic.flush().expect("should produce a batch");
-        assert_eq!(batch.source_node, NodeId(1));
+        assert_eq!(batch.source_node, NodeId("1".to_string()));
         assert_eq!(batch.notifications.len(), 2);
 
         let names: Vec<&str> = batch
@@ -241,24 +241,24 @@ mod tests {
     // CFA-07
     #[test]
     fn higher_incarnation_wins_dedup() {
-        let mut logic = ChangeFeedLogic::new(NodeId(1));
+        let mut logic = ChangeFeedLogic::new(NodeId("1".to_string()));
 
-        logic.notify_change("counters".into(), NodeId(2), gen(100, 50));
-        logic.notify_change("counters".into(), NodeId(2), gen(200, 1));
+        logic.notify_change("counters".into(), NodeId("2".to_string()), gen(100, 50));
+        logic.notify_change("counters".into(), NodeId("2".to_string()), gen(200, 1));
 
         assert_eq!(logic.pending_count(), 1);
         assert_eq!(
-            logic.pending[&("counters".to_string(), NodeId(2))],
+            logic.pending[&("counters".to_string(), NodeId("2".to_string()))],
             gen(200, 1),
         );
     }
 
     #[test]
     fn flush_clears_pending() {
-        let mut logic = ChangeFeedLogic::new(NodeId(1));
+        let mut logic = ChangeFeedLogic::new(NodeId("1".to_string()));
 
-        logic.notify_change("counters".into(), NodeId(2), gen(1, 1));
-        logic.notify_change("sessions".into(), NodeId(3), gen(2, 5));
+        logic.notify_change("counters".into(), NodeId("2".to_string()), gen(1, 1));
+        logic.notify_change("sessions".into(), NodeId("3".to_string()), gen(2, 5));
         assert_eq!(logic.pending_count(), 2);
 
         let _ = logic.flush();
@@ -268,32 +268,32 @@ mod tests {
     #[test]
     fn route_inbound_batch_routes_correctly() {
         let batch = BatchedChangeFeed {
-            source_node: NodeId(5),
+            source_node: NodeId("5".to_string()),
             notifications: vec![
                 ChangeNotification {
                     state_name: "counters".into(),
-                    source_node: NodeId(2),
+                    source_node: NodeId("2".to_string()),
                     generation: gen(1, 10),
                 },
                 ChangeNotification {
                     state_name: "counters".into(),
-                    source_node: NodeId(3),
+                    source_node: NodeId("3".to_string()),
                     generation: gen(2, 5),
                 },
                 ChangeNotification {
                     state_name: "sessions".into(),
-                    source_node: NodeId(2),
+                    source_node: NodeId("2".to_string()),
                     generation: gen(1, 7),
                 },
             ],
         };
 
-        let routed = ChangeFeedLogic::route_inbound_batch(&batch, NodeId(1));
+        let routed = ChangeFeedLogic::route_inbound_batch(&batch, NodeId("1".to_string()));
         assert_eq!(routed.len(), 3);
 
-        assert!(routed.contains(&("counters".to_string(), NodeId(2), gen(1, 10))));
-        assert!(routed.contains(&("counters".to_string(), NodeId(3), gen(2, 5))));
-        assert!(routed.contains(&("sessions".to_string(), NodeId(2), gen(1, 7))));
+        assert!(routed.contains(&("counters".to_string(), NodeId("2".to_string()), gen(1, 10))));
+        assert!(routed.contains(&("counters".to_string(), NodeId("3".to_string()), gen(2, 5))));
+        assert!(routed.contains(&("sessions".to_string(), NodeId("2".to_string()), gen(1, 7))));
     }
 
     // ── CFA-04: Inbound batch routes to correct shards ──────────
@@ -303,22 +303,22 @@ mod tests {
     #[test]
     fn inbound_batch_routes_to_correct_shards() {
         let batch = BatchedChangeFeed {
-            source_node: NodeId(10),
+            source_node: NodeId("10".to_string()),
             notifications: vec![
                 ChangeNotification {
                     state_name: "counters".into(),
-                    source_node: NodeId(2),
+                    source_node: NodeId("2".to_string()),
                     generation: gen(1, 20),
                 },
                 ChangeNotification {
                     state_name: "sessions".into(),
-                    source_node: NodeId(2),
+                    source_node: NodeId("2".to_string()),
                     generation: gen(1, 15),
                 },
             ],
         };
 
-        let routed = ChangeFeedLogic::route_inbound_batch(&batch, NodeId(1));
+        let routed = ChangeFeedLogic::route_inbound_batch(&batch, NodeId("1".to_string()));
         assert_eq!(routed.len(), 2);
 
         // Verify each notification maps to the correct (state_name, source_node, generation).
@@ -327,12 +327,12 @@ mod tests {
 
         let (cn, cs, cg) = counter_entry.expect("counters entry should be present");
         assert_eq!(cn, "counters");
-        assert_eq!(*cs, NodeId(2));
+        assert_eq!(*cs, NodeId("2".to_string()));
         assert_eq!(*cg, gen(1, 20));
 
         let (sn, ss, sg) = session_entry.expect("sessions entry should be present");
         assert_eq!(sn, "sessions");
-        assert_eq!(*ss, NodeId(2));
+        assert_eq!(*ss, NodeId("2".to_string()));
         assert_eq!(*sg, gen(1, 15));
     }
 

@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] — Unreleased
+
+### Breaking Changes
+
+- **`NodeId` changed from `NodeId(pub u64)` to `NodeId(String)`** — Re-exported from
+  `dactor::NodeId`. Constructors change from `NodeId(1)` to `NodeId("1".to_string())`.
+  `NodeId` is no longer `Copy` (only `Clone`), so `.copied()` becomes `.cloned()` and
+  explicit `.clone()` calls are needed where values were previously copied. Map/set
+  ordering is now lexicographic (String) rather than numeric (u64).
+- **Removed `ActorRuntime` trait** — Actor runtime abstraction is now provided by
+  the [`dactor`](https://crates.io/crates/dactor) crate. Use `dactor-ractor`,
+  `dactor-kameo`, or `dactor-coerce` for a concrete backend.
+- **Removed `ActorRef<M>` trait** — Use `dactor::ActorRef<A>` instead.
+- **Removed `TestRuntime`** — The mock actor runtime for testing. Use
+  `dactor`'s test support or test the engine directly with `DistributedStateEngine`.
+- **Removed `TestActorRef<M>`** — Replaced by dactor's test actor references.
+- **Removed adapter crates** — `dstate-ractor`, `dstate-kameo`, and `dstate-e2e`
+  are no longer part of this workspace. Use `dactor` adapter crates directly.
+- **Error types re-exported from dactor** — `ActorSendError`, `ClusterError`,
+  `GroupError` are now re-exported from `dactor::errors`.
+- **`ClusterEvent`, `ClusterEvents`, `SubscriptionId`, `TimerHandle`** are now
+  re-exported from `dactor`. `ClusterEvent` is `#[non_exhaustive]`; match
+  statements require a wildcard arm.
+
+### Added
+
+- `dactor` dependency for actor framework integration.
+- `TestTimerHandle::new()` constructor for creating test timer handles.
+
+### Changed
+
+- `TestClusterEvents` and `TestTimerHandle` remain in `test_support::test_runtime`
+  for testing cluster event handling and timer cancellation without an actor framework.
+- Updated design document (§1, §6.0, §16) to reflect dactor-based architecture.
+
+### Migration Guide
+
+Replace your dependency on `dstate-ractor` or `dstate-kameo` with the
+corresponding `dactor` adapter crate:
+
+```toml
+# Before (v0.1)
+dstate = "0.1"
+dstate-ractor = "0.1"
+
+# After (v1.0)
+dstate = "1"
+dactor-ractor = "0.2"
+```
+
+Code that implemented `dstate::ActorRuntime` should now use `dactor` traits
+directly. The dstate core engine (`DistributedStateEngine`) is unchanged —
+it remains runtime-agnostic and does not require any actor framework.
+
 ## [0.1.0] — Unreleased
 
 Initial release of the dstate distributed state replication workspace.

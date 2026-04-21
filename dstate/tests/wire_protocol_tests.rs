@@ -5,7 +5,7 @@ use dstate::{BatchedChangeFeed, ChangeNotification, Generation, NodeId, SyncMess
 fn full_snapshot_round_trip() {
     let msg = SyncMessage::FullSnapshot {
         state_name: "node_resource".into(),
-        source_node: NodeId(42),
+        source_node: NodeId("42".to_string()),
         generation: Generation::new(3, 15),
         wire_version: 2,
         data: vec![1, 2, 3, 4],
@@ -23,7 +23,7 @@ fn full_snapshot_round_trip() {
             data,
         } => {
             assert_eq!(state_name, "node_resource");
-            assert_eq!(source_node, NodeId(42));
+            assert_eq!(source_node, NodeId("42".to_string()));
             assert_eq!(generation, Generation::new(3, 15));
             assert_eq!(wire_version, 2);
             assert_eq!(data, vec![1, 2, 3, 4]);
@@ -37,7 +37,7 @@ fn full_snapshot_round_trip() {
 fn delta_update_round_trip() {
     let msg = SyncMessage::DeltaUpdate {
         state_name: "session_map".into(),
-        source_node: NodeId(7),
+        source_node: NodeId("7".to_string()),
         generation: Generation::new(1, 100),
         wire_version: 1,
         data: vec![10, 20, 30],
@@ -55,7 +55,7 @@ fn delta_update_round_trip() {
             data,
         } => {
             assert_eq!(state_name, "session_map");
-            assert_eq!(source_node, NodeId(7));
+            assert_eq!(source_node, NodeId("7".to_string()));
             assert_eq!(generation, Generation::new(1, 100));
             assert_eq!(wire_version, 1);
             assert_eq!(data, vec![10, 20, 30]);
@@ -68,21 +68,21 @@ fn delta_update_round_trip() {
 #[test]
 fn batched_change_feed_round_trip() {
     let feed = BatchedChangeFeed {
-        source_node: NodeId(1),
+        source_node: NodeId("1".to_string()),
         notifications: vec![
             ChangeNotification {
                 state_name: "alpha".into(),
-                source_node: NodeId(1),
+                source_node: NodeId("1".to_string()),
                 generation: Generation::new(1, 0),
             },
             ChangeNotification {
                 state_name: "beta".into(),
-                source_node: NodeId(2),
+                source_node: NodeId("2".to_string()),
                 generation: Generation::new(2, 5),
             },
             ChangeNotification {
                 state_name: "gamma".into(),
-                source_node: NodeId(3),
+                source_node: NodeId("3".to_string()),
                 generation: Generation::new(0, 99),
             },
         ],
@@ -91,19 +91,19 @@ fn batched_change_feed_round_trip() {
     let bytes = bincode::serialize(&feed).expect("serialize");
     let decoded: BatchedChangeFeed = bincode::deserialize(&bytes).expect("deserialize");
 
-    assert_eq!(decoded.source_node, NodeId(1));
+    assert_eq!(decoded.source_node, NodeId("1".to_string()));
     assert_eq!(decoded.notifications.len(), 3);
 
     assert_eq!(decoded.notifications[0].state_name, "alpha");
-    assert_eq!(decoded.notifications[0].source_node, NodeId(1));
+    assert_eq!(decoded.notifications[0].source_node, NodeId("1".to_string()));
     assert_eq!(decoded.notifications[0].generation, Generation::new(1, 0));
 
     assert_eq!(decoded.notifications[1].state_name, "beta");
-    assert_eq!(decoded.notifications[1].source_node, NodeId(2));
+    assert_eq!(decoded.notifications[1].source_node, NodeId("2".to_string()));
     assert_eq!(decoded.notifications[1].generation, Generation::new(2, 5));
 
     assert_eq!(decoded.notifications[2].state_name, "gamma");
-    assert_eq!(decoded.notifications[2].source_node, NodeId(3));
+    assert_eq!(decoded.notifications[2].source_node, NodeId("3".to_string()));
     assert_eq!(decoded.notifications[2].generation, Generation::new(0, 99));
 }
 
@@ -112,7 +112,7 @@ fn batched_change_feed_round_trip() {
 fn request_snapshot_round_trip() {
     let msg = SyncMessage::RequestSnapshot {
         state_name: "cluster_config".into(),
-        requester: NodeId(99),
+        requester: NodeId("99".to_string()),
     };
 
     let bytes = bincode::serialize(&msg).expect("serialize");
@@ -124,7 +124,7 @@ fn request_snapshot_round_trip() {
             requester,
         } => {
             assert_eq!(state_name, "cluster_config");
-            assert_eq!(requester, NodeId(99));
+            assert_eq!(requester, NodeId("99".to_string()));
         }
         other => panic!("expected RequestSnapshot, got {other:?}"),
     }
@@ -134,7 +134,7 @@ fn request_snapshot_round_trip() {
 fn empty_data_round_trip() {
     let msg = SyncMessage::FullSnapshot {
         state_name: "empty_state".into(),
-        source_node: NodeId(0),
+        source_node: NodeId("0".to_string()),
         generation: Generation::new(0, 0),
         wire_version: 1,
         data: vec![],
@@ -157,7 +157,7 @@ fn large_payload_round_trip() {
 
     let msg = SyncMessage::FullSnapshot {
         state_name: "big_state".into(),
-        source_node: NodeId(5),
+        source_node: NodeId("5".to_string()),
         generation: Generation::new(10, 500),
         wire_version: 3,
         data: payload.clone(),
@@ -175,7 +175,7 @@ fn large_payload_round_trip() {
             data,
         } => {
             assert_eq!(state_name, "big_state");
-            assert_eq!(source_node, NodeId(5));
+            assert_eq!(source_node, NodeId("5".to_string()));
             assert_eq!(generation, Generation::new(10, 500));
             assert_eq!(wire_version, 3);
             assert_eq!(data.len(), 10 * 1024);

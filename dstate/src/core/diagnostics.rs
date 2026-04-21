@@ -159,9 +159,9 @@ impl DiagnosticsLogic {
     ///
     /// Resets consecutive failures, updates latency and timestamps.
     /// Called by `record_delta_received` and `record_snapshot_received`.
-    pub fn record_sync_success(&mut self, peer: NodeId, latency_ms: u64, clock: &dyn Clock) {
+    pub fn record_sync_success(&mut self, peer: &NodeId, latency_ms: u64, clock: &dyn Clock) {
         let now = clock.unix_ms();
-        let diag = self.peers.entry(peer).or_default();
+        let diag = self.peers.entry(peer.clone()).or_default();
         diag.consecutive_failures = 0;
         diag.last_sync_time = Some(now);
         diag.last_attempt_time = Some(now);
@@ -177,9 +177,9 @@ impl DiagnosticsLogic {
     }
 
     /// Record a sync failure for a peer.
-    pub fn record_sync_failure(&mut self, peer: NodeId, error: &str, clock: &dyn Clock) {
+    pub fn record_sync_failure(&mut self, peer: &NodeId, error: &str, clock: &dyn Clock) {
         let now = clock.unix_ms();
-        let diag = self.peers.entry(peer).or_default();
+        let diag = self.peers.entry(peer.clone()).or_default();
         diag.consecutive_failures += 1;
         diag.last_attempt_time = Some(now);
         diag.last_error = Some(error.to_string());
@@ -195,8 +195,8 @@ impl DiagnosticsLogic {
     }
 
     /// Record an age gap detected on inbound delta.
-    pub fn record_gap_detected(&mut self, peer: NodeId) {
-        let diag = self.peers.entry(peer).or_default();
+    pub fn record_gap_detected(&mut self, peer: &NodeId) {
+        let diag = self.peers.entry(peer.clone()).or_default();
         diag.gap_count += 1;
         self.metrics.age_gaps_detected += 1;
     }
@@ -212,7 +212,7 @@ impl DiagnosticsLogic {
     }
 
     /// Record an inbound delta received and applied.
-    pub fn record_delta_received(&mut self, peer: NodeId, latency_ms: u64, clock: &dyn Clock) {
+    pub fn record_delta_received(&mut self, peer: &NodeId, latency_ms: u64, clock: &dyn Clock) {
         self.metrics.deltas_received += 1;
         self.record_sync_success(peer, latency_ms, clock);
     }
@@ -225,7 +225,7 @@ impl DiagnosticsLogic {
     /// Record an inbound snapshot received and applied.
     pub fn record_snapshot_received(
         &mut self,
-        peer: NodeId,
+        peer: &NodeId,
         latency_ms: u64,
         clock: &dyn Clock,
     ) {
@@ -275,7 +275,7 @@ impl DiagnosticsLogic {
                 let diag = self.peers.get(node_id);
                 let remote_age = view.pending_remote_generation.map(|g| g.age);
                 PeerSyncStatus {
-                    node_id: *node_id,
+                    node_id: node_id.clone(),
                     local_age: view.generation.age,
                     remote_age,
                     gap_count: diag.map_or(0, |d| d.gap_count),
@@ -407,18 +407,18 @@ mod tests {
             clock.as_ref(),
         );
         let view = state.value.clone();
-        ShardCore::new(NodeId(1), state, view, clock)
+        ShardCore::new(NodeId("1".to_string()), state, view, clock)
     }
 
     fn make_3_node_shard(clock: Arc<dyn Clock>) -> ShardCore<TestState, TestState> {
         let shard = make_shard(clock.clone());
-        shard.on_node_joined(NodeId(2), TestState { counter: 0, label: "".into() });
-        shard.on_node_joined(NodeId(3), TestState { counter: 0, label: "".into() });
+        shard.on_node_joined(NodeId("2".to_string()), TestState { counter: 0, label: "".into() });
+        shard.on_node_joined(NodeId("3".to_string()), TestState { counter: 0, label: "".into() });
 
         // Accept snapshots to populate real views
         let now_ms = clock.unix_ms();
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(100, 5),
             wire_version: 1,
             view: TestState { counter: 5, label: "node2".into() },
@@ -426,7 +426,7 @@ mod tests {
             modified_time: now_ms,
         });
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(3),
+            source: NodeId("3".to_string()),
             generation: Generation::new(200, 3),
             wire_version: 1,
             view: TestState { counter: 3, label: "node3".into() },
@@ -447,10 +447,10 @@ mod tests {
         let status = diag.sync_status(&shard);
         assert_eq!(status.len(), 3); // self + 2 peers
 
-        let ids: Vec<NodeId> = status.iter().map(|s| s.node_id).collect();
-        assert!(ids.contains(&NodeId(1)));
-        assert!(ids.contains(&NodeId(2)));
-        assert!(ids.contains(&NodeId(3)));
+        let ids: Vec<NodeId> = status.iter().map(|s| s.node_id.clone()).collect();
+        assert!(ids.contains(&NodeId("1".to_string())));
+        assert!(ids.contains(&NodeId("2".to_string())));
+        assert!(ids.contains(&NodeId("3".to_string())));
     }
 
     // ── DIAG-02: consecutive_failures increments on failure ──────
@@ -461,12 +461,12 @@ mod tests {
         let shard = make_3_node_shard(clock.clone());
         let mut diag = DiagnosticsLogic::new("test_state".into());
 
-        diag.record_sync_failure(NodeId(2), "timeout", clock.as_ref());
-        diag.record_sync_failure(NodeId(2), "timeout", clock.as_ref());
-        diag.record_sync_failure(NodeId(2), "connection refused", clock.as_ref());
+        diag.record_sync_failure(&NodeId("2".to_string()), "timeout", clock.as_ref());
+        diag.record_sync_failure(&NodeId("2".to_string()), "timeout", clock.as_ref());
+        diag.record_sync_failure(&NodeId("2".to_string()), "connection refused", clock.as_ref());
 
         let status = diag.sync_status(&shard);
-        let peer2 = status.iter().find(|s| s.node_id == NodeId(2)).unwrap();
+        let peer2 = status.iter().find(|s| s.node_id == NodeId("2".to_string())).unwrap();
         assert_eq!(peer2.consecutive_failures, 3);
     }
 
@@ -478,14 +478,14 @@ mod tests {
         let shard = make_3_node_shard(clock.clone());
         let mut diag = DiagnosticsLogic::new("test_state".into());
 
-        diag.record_sync_failure(NodeId(2), "err1", clock.as_ref());
-        diag.record_sync_failure(NodeId(2), "err2", clock.as_ref());
-        assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 2);
+        diag.record_sync_failure(&NodeId("2".to_string()), "err1", clock.as_ref());
+        diag.record_sync_failure(&NodeId("2".to_string()), "err2", clock.as_ref());
+        assert_eq!(diag.peers.get(&NodeId("2".to_string())).unwrap().consecutive_failures, 2);
 
-        diag.record_sync_success(NodeId(2), 5, clock.as_ref());
+        diag.record_sync_success(&NodeId("2".to_string()), 5, clock.as_ref());
 
         let status = diag.sync_status(&shard);
-        let peer2 = status.iter().find(|s| s.node_id == NodeId(2)).unwrap();
+        let peer2 = status.iter().find(|s| s.node_id == NodeId("2".to_string())).unwrap();
         assert_eq!(peer2.consecutive_failures, 0);
         assert!(peer2.last_error.is_none());
     }
@@ -498,10 +498,10 @@ mod tests {
         let shard = make_3_node_shard(clock.clone());
         let mut diag = DiagnosticsLogic::new("test_state".into());
 
-        diag.record_sync_success(NodeId(2), 42, clock.as_ref());
+        diag.record_sync_success(&NodeId("2".to_string()), 42, clock.as_ref());
 
         let status = diag.sync_status(&shard);
-        let peer2 = status.iter().find(|s| s.node_id == NodeId(2)).unwrap();
+        let peer2 = status.iter().find(|s| s.node_id == NodeId("2".to_string())).unwrap();
         assert_eq!(peer2.last_sync_latency_ms, Some(42));
     }
 
@@ -513,10 +513,10 @@ mod tests {
         let shard = make_3_node_shard(clock.clone());
         let mut diag = DiagnosticsLogic::new("test_state".into());
 
-        diag.record_sync_failure(NodeId(3), "connection timed out", clock.as_ref());
+        diag.record_sync_failure(&NodeId("3".to_string()), "connection timed out", clock.as_ref());
 
         let status = diag.sync_status(&shard);
-        let peer3 = status.iter().find(|s| s.node_id == NodeId(3)).unwrap();
+        let peer3 = status.iter().find(|s| s.node_id == NodeId("3".to_string())).unwrap();
         assert_eq!(peer3.last_error.as_deref(), Some("connection timed out"));
     }
 
@@ -528,11 +528,11 @@ mod tests {
         let shard = make_3_node_shard(clock.clone());
         let mut diag = DiagnosticsLogic::new("test_state".into());
 
-        diag.record_gap_detected(NodeId(2));
-        diag.record_gap_detected(NodeId(2));
+        diag.record_gap_detected(&NodeId("2".to_string()));
+        diag.record_gap_detected(&NodeId("2".to_string()));
 
         let status = diag.sync_status(&shard);
-        let peer2 = status.iter().find(|s| s.node_id == NodeId(2)).unwrap();
+        let peer2 = status.iter().find(|s| s.node_id == NodeId("2".to_string())).unwrap();
         assert_eq!(peer2.gap_count, 2);
     }
 
@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn diag_11_age_gaps_detected() {
         let mut diag = DiagnosticsLogic::new("test_state".into());
-        diag.record_gap_detected(NodeId(2));
+        diag.record_gap_detected(&NodeId("2".to_string()));
         assert_eq!(diag.metrics().age_gaps_detected, 1);
     }
 
@@ -604,9 +604,9 @@ mod tests {
         let clock = test_clock();
         let mut diag = DiagnosticsLogic::new("test_state".into());
 
-        diag.record_sync_failure(NodeId(2), "network", clock.as_ref());
-        diag.record_sync_failure(NodeId(3), "serde", clock.as_ref());
-        diag.record_sync_failure(NodeId(2), "timeout", clock.as_ref());
+        diag.record_sync_failure(&NodeId("2".to_string()), "network", clock.as_ref());
+        diag.record_sync_failure(&NodeId("3".to_string()), "serde", clock.as_ref());
+        diag.record_sync_failure(&NodeId("2".to_string()), "timeout", clock.as_ref());
 
         assert_eq!(diag.metrics().sync_failures, 3);
     }
@@ -624,7 +624,7 @@ mod tests {
 
         // Re-sync node 2 only
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(100, 6),
             wire_version: 1,
             view: TestState { counter: 6, label: "node2".into() },
@@ -635,7 +635,7 @@ mod tests {
         // Node 3 is stale (30s old), node 2 is fresh
         let stale = shard.stale_peers(Duration::from_secs(10));
         assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0], NodeId(3));
+        assert_eq!(stale[0], NodeId("3".to_string()));
     }
 
     // ── DIAG-15: returns empty when all fresh ───────────────────
@@ -677,14 +677,14 @@ mod tests {
 
         // 4-node cluster: self + 3 peers
         let shard = make_shard(clock.clone());
-        shard.on_node_joined(NodeId(2), TestState { counter: 0, label: "".into() });
-        shard.on_node_joined(NodeId(3), TestState { counter: 0, label: "".into() });
-        shard.on_node_joined(NodeId(4), TestState { counter: 0, label: "".into() });
+        shard.on_node_joined(NodeId("2".to_string()), TestState { counter: 0, label: "".into() });
+        shard.on_node_joined(NodeId("3".to_string()), TestState { counter: 0, label: "".into() });
+        shard.on_node_joined(NodeId("4".to_string()), TestState { counter: 0, label: "".into() });
 
         let now_ms = clock.unix_ms();
         for id in [2, 3, 4] {
             shard.accept_inbound_snapshot(InboundSnapshot {
-                source: NodeId(id),
+                source: NodeId(id.to_string()),
                 generation: Generation::new(id as u64 * 100, 1),
                 wire_version: 1,
                 view: TestState { counter: 1, label: format!("n{}", id) },
@@ -699,7 +699,7 @@ mod tests {
         // Refresh 2 of 3 peers
         for id in [2, 3] {
             shard.accept_inbound_snapshot(InboundSnapshot {
-                source: NodeId(id),
+                source: NodeId(id.to_string()),
                 generation: Generation::new(id as u64 * 100, 2),
                 wire_version: 1,
                 view: TestState { counter: 2, label: format!("n{}", id) },
@@ -768,7 +768,7 @@ mod tests {
         let clock = test_clock();
         let mut diag = DiagnosticsLogic::new("node_resource".into());
 
-        diag.record_sync_success(NodeId(2), 3, clock.as_ref());
+        diag.record_sync_success(&NodeId("2".to_string()), 3, clock.as_ref());
 
         assert!(logs_contain("sync succeeded"));
         assert!(logs_contain("node_resource"));
@@ -783,7 +783,7 @@ mod tests {
         let clock = test_clock();
         let mut diag = DiagnosticsLogic::new("node_resource".into());
 
-        diag.record_sync_failure(NodeId(3), "connection timed out", clock.as_ref());
+        diag.record_sync_failure(&NodeId("3".to_string()), "connection timed out", clock.as_ref());
 
         assert!(logs_contain("sync failed"));
         assert!(logs_contain("node_resource"));
@@ -829,12 +829,12 @@ mod tests {
         // 5-node cluster: self + 4 peers
         let shard = make_shard(clock.clone());
         for id in [2, 3, 4, 5] {
-            shard.on_node_joined(NodeId(id), TestState { counter: 0, label: "".into() });
+            shard.on_node_joined(NodeId(id.to_string()), TestState { counter: 0, label: "".into() });
         }
         let now_ms = clock.unix_ms();
         for id in [2, 3, 4, 5] {
             shard.accept_inbound_snapshot(InboundSnapshot {
-                source: NodeId(id),
+                source: NodeId(id.to_string()),
                 generation: Generation::new(id as u64 * 100, 1),
                 wire_version: 1,
                 view: TestState { counter: 1, label: format!("n{}", id) },
@@ -849,7 +849,7 @@ mod tests {
         // Refresh nodes 2 and 3 (fresh), leave node 4 stale
         for id in [2, 3] {
             shard.accept_inbound_snapshot(InboundSnapshot {
-                source: NodeId(id),
+                source: NodeId(id.to_string()),
                 generation: Generation::new(id as u64 * 100, 2),
                 wire_version: 1,
                 view: TestState { counter: 2, label: format!("n{}", id) },
@@ -860,11 +860,11 @@ mod tests {
 
         // Node 5 is fresh but failing (record failure)
         let mut diag = DiagnosticsLogic::new("test_state".into());
-        diag.record_sync_failure(NodeId(5), "connection refused", clock.as_ref());
+        diag.record_sync_failure(&NodeId("5".to_string()), "connection refused", clock.as_ref());
 
         // Refresh node 5 view so it's NOT stale, but HAS consecutive_failures
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(5),
+            source: NodeId("5".to_string()),
             generation: Generation::new(500, 2),
             wire_version: 1,
             view: TestState { counter: 2, label: "n5".into() },
@@ -888,10 +888,10 @@ mod tests {
         let clock = test_clock();
         let mut diag = DiagnosticsLogic::new("test_state".into());
 
-        diag.record_sync_failure(NodeId(2), "err", clock.as_ref());
+        diag.record_sync_failure(&NodeId("2".to_string()), "err", clock.as_ref());
         assert_eq!(diag.peers.len(), 1);
 
-        diag.remove_peer(&NodeId(2));
+        diag.remove_peer(&NodeId("2".to_string()));
         assert_eq!(diag.peers.len(), 0);
     }
 
@@ -903,22 +903,22 @@ mod tests {
         let mut diag = DiagnosticsLogic::new("test_state".into());
 
         // Build up failures
-        diag.record_sync_failure(NodeId(2), "err1", clock.as_ref());
-        diag.record_sync_failure(NodeId(2), "err2", clock.as_ref());
-        assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 2);
+        diag.record_sync_failure(&NodeId("2".to_string()), "err1", clock.as_ref());
+        diag.record_sync_failure(&NodeId("2".to_string()), "err2", clock.as_ref());
+        assert_eq!(diag.peers.get(&NodeId("2".to_string())).unwrap().consecutive_failures, 2);
 
         // Delta received clears failures
-        diag.record_delta_received(NodeId(2), 5, clock.as_ref());
-        assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 0);
+        diag.record_delta_received(&NodeId("2".to_string()), 5, clock.as_ref());
+        assert_eq!(diag.peers.get(&NodeId("2".to_string())).unwrap().consecutive_failures, 0);
         assert_eq!(diag.metrics().deltas_received, 1);
 
         // Build up again
-        diag.record_sync_failure(NodeId(2), "err3", clock.as_ref());
-        assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 1);
+        diag.record_sync_failure(&NodeId("2".to_string()), "err3", clock.as_ref());
+        assert_eq!(diag.peers.get(&NodeId("2".to_string())).unwrap().consecutive_failures, 1);
 
         // Snapshot received clears failures
-        diag.record_snapshot_received(NodeId(2), 3, clock.as_ref());
-        assert_eq!(diag.peers.get(&NodeId(2)).unwrap().consecutive_failures, 0);
+        diag.record_snapshot_received(&NodeId("2".to_string()), 3, clock.as_ref());
+        assert_eq!(diag.peers.get(&NodeId("2".to_string())).unwrap().consecutive_failures, 0);
         assert_eq!(diag.metrics().snapshots_received, 1);
     }
 
@@ -937,7 +937,7 @@ mod tests {
 
         // Also record failures on node 2 → both stale AND failing
         let mut diag = DiagnosticsLogic::new("test_state".into());
-        diag.record_sync_failure(NodeId(2), "timeout", clock.as_ref());
+        diag.record_sync_failure(&NodeId("2".to_string()), "timeout", clock.as_ref());
 
         let health = diag.health_status(&shard, Duration::from_secs(10));
         // Node 2: stale + failing, Node 3: stale only

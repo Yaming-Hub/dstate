@@ -107,14 +107,14 @@ impl StateRegistry {
     /// Broadcast `NodeJoined` to all registered shards.
     pub fn broadcast_node_joined(&self, node_id: NodeId) {
         for (_, shard) in self.shards.values() {
-            shard.on_node_joined(node_id);
+            shard.on_node_joined(node_id.clone());
         }
     }
 
     /// Broadcast `NodeLeft` to all registered shards.
     pub fn broadcast_node_left(&self, node_id: NodeId) {
         for (_, shard) in self.shards.values() {
-            shard.on_node_left(node_id);
+            shard.on_node_left(node_id.clone());
         }
     }
 

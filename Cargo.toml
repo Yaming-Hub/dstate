@@ -1,3 +1,3 @@
 [workspace]
-members = ["dstate", "dstate-ractor", "dstate-kameo", "dstate-integration", "dstate-e2e"]
+members = ["dstate", "dstate-integration"]
 resolver = "2"

@@ -146,13 +146,13 @@ where
     pub fn snapshot(&self) -> HashMap<NodeId, StateViewObject<V>> {
         let map = self.inner.load();
         map.iter()
-            .map(|(k, v)| (*k, (*v.load_full()).clone()))
+            .map(|(k, v)| (k.clone(), (*v.load_full()).clone()))
             .collect()
     }
 
     /// Collect all node IDs currently in the map.
     pub fn node_ids(&self) -> Vec<NodeId> {
-        self.inner.load().keys().copied().collect()
+        self.inner.load().keys().cloned().collect()
     }
 
     /// Return peers whose views are stale, excluding the local node.
@@ -162,7 +162,7 @@ where
     /// - `synced_at` is older than `max_staleness`
     pub fn stale_peers(
         &self,
-        local_node: NodeId,
+        local_node: &NodeId,
         max_staleness: Duration,
         clock: &dyn Clock,
     ) -> Vec<NodeId> {
@@ -170,13 +170,13 @@ where
         let now = clock.now();
 
         map.iter()
-            .filter(|(id, _)| **id != local_node)
+            .filter(|(id, _)| *id != local_node)
             .filter(|(_, entry)| {
                 let vo = entry.load();
                 vo.pending_remote_generation.is_some()
                     || now.duration_since(vo.synced_at) > max_staleness
             })
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id.clone())
             .collect()
     }
 
@@ -209,7 +209,7 @@ where
                     Some(new_view) => {
                         let mut new_map = (**map).clone();
                         new_map.insert(
-                            *node_id,
+                            node_id.clone(),
                             Arc::new(ArcSwap::from_pointee(new_view)),
                         );
                         self.inner.store(Arc::new(new_map));
