@@ -90,6 +90,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dactor-mock"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8b10167a75c04c21cb3b1f3d49070a7bab6f41a217536b7be681e6087790cc0"
+dependencies = [
+ "async-trait",
+ "dactor",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "dstate"
 version = "1.0.0"
 dependencies = [
@@ -108,7 +121,10 @@ dependencies = [
 name = "dstate-integration"
 version = "1.0.0"
 dependencies = [
+ "async-trait",
  "bincode",
+ "dactor",
+ "dactor-mock",
  "dstate",
  "serde",
  "tokio",
