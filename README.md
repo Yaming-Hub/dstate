@@ -7,22 +7,25 @@ across nodes in a cluster. State changes are projected into public views,
 synchronized via configurable strategies (active push, change-feed, periodic
 sync), and persisted through a pluggable storage interface.
 
+Actor runtime capabilities (spawning, messaging, timers, groups, cluster
+discovery) are provided by the [`dactor`](https://crates.io/crates/dactor)
+crate and its adapter crates (`dactor-ractor`, `dactor-kameo`, `dactor-coerce`).
+
 ## Workspace Crates
 
 | Crate | Description |
 |-------|-------------|
 | [`dstate`](dstate/) | Core library — traits, types, replication logic, test support |
-| [`dstate-ractor`](dstate-ractor/) | Adapter for the [ractor](https://crates.io/crates/ractor) actor framework |
-| [`dstate-kameo`](dstate-kameo/) | Adapter for the [kameo](https://crates.io/crates/kameo) actor framework |
+| [`dstate-integration`](dstate-integration/) | Integration tests for multi-node scenarios |
 
 ## Quick Start
 
-Add the core crate and an adapter to your `Cargo.toml`:
+Add `dstate` and a `dactor` adapter to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dstate = "0.1"
-dstate-ractor = "0.1"   # or dstate-kameo = "0.1"
+dstate = "1"
+dactor-ractor = "0.2"   # or dactor-kameo, dactor-coerce
 ```
 
 ### Define a Distributed State
@@ -55,44 +58,37 @@ impl DistributedState for Counter {
 ```
 
 For state types with private fields, delta synchronization, or view
-projections, implement `DeltaDistributedState` instead. See the example
-programs in each adapter crate's `examples/` directory.
+projections, implement `DeltaDistributedState` instead.
 
-### Use an Actor Runtime
+### Use with dactor
+
+Use `dactor` for the actor runtime layer. `dstate` provides the replication
+engine; `dactor` provides actor spawning, messaging, timers, and cluster
+events. Your shell code bridges the two:
 
 ```rust
-use dstate::{ActorRuntime, ActorRef};
-use dstate_ractor::RactorRuntime;  // or dstate_kameo::KameoRuntime
-
-#[tokio::main]
-async fn main() {
-    let runtime = RactorRuntime::new();
-
-    // Spawn an actor that handles u64 messages
-    let actor = runtime.spawn("counter", |msg: u64| {
-        println!("Received: {msg}");
-    });
-
-    // Fire-and-forget send
-    actor.send(42).unwrap();
-}
+use dstate::engine::DistributedStateEngine;
+use dstate::{NodeId, StateConfig, SyncStrategy};
+use dactor::prelude::*;  // ActorRef, Handler, etc.
 ```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│              Application Code               │
-├─────────────────────────────────────────────┤
-│     dstate (core traits + replication)      │
-│  ┌─────────┐  ┌──────────┐  ┌───────────┐  │
-│  │  State   │  │  Sync    │  │ Persistence│  │
-│  │  Traits  │  │ Strategy │  │  Traits    │  │
-│  └─────────┘  └──────────┘  └───────────┘  │
-├──────────────────┬──────────────────────────┤
-│  dstate-ractor   │     dstate-kameo         │
-│  (ractor adapter)│     (kameo adapter)      │
-└──────────────────┴──────────────────────────┘
+┌──────────────────────────────────────────────┐
+│              Application Code                │
+├──────────────────────────────────────────────┤
+│                 Shell Layer                  │
+│  (bridges dactor actors with dstate engine)  │
+├──────────────┬───────────────────────────────┤
+│    dstate    │          dactor               │
+│  (state      │  (actor spawning, messaging,  │
+│  replication │   timers, groups, cluster)    │
+│  engine)     │                               │
+├──────────────┤───────────────────────────────┤
+│              │  dactor-ractor / dactor-kameo  │
+│              │  / dactor-coerce               │
+└──────────────┴───────────────────────────────┘
 ```
 
 ### Key Concepts
@@ -106,36 +102,28 @@ async fn main() {
   - `feed_lazy_pull()` — Batch changes, pull on query
   - `feed_with_periodic_sync()` — Change feed plus periodic full sync
   - `periodic_only()` — Only periodic full snapshots
-- **ActorRuntime** — Framework-agnostic actor spawning, timers, and groups
 - **ClusterEvents** — Subscribe to node join/leave notifications
 - **StatePersistence** — Async save/load for crash recovery
-
-### Choosing an Adapter
-
-| Feature | `dstate-ractor` | `dstate-kameo` |
-|---------|----------------|----------------|
-| Framework | [ractor](https://crates.io/crates/ractor) | [kameo](https://crates.io/crates/kameo) |
-| Mailbox | Unbounded | Bounded (default) |
-| Spawn | Async (bridge thread) | Sync (cheaper) |
-| Send | `cast()` fire-and-forget | `tell().try_send()` fire-and-forget |
-| Timers | tokio tasks | tokio tasks |
-
-Both adapters expose identical `ActorRuntime` semantics. Choose based on your
-preferred actor framework.
 
 ## Testing
 
 The core crate includes `test_support` with mock implementations:
 
-- `TestRuntime` — In-memory actor runtime with channel-based mailboxes
+- `TestClusterEvents` — Manually-triggered cluster event emitter
 - `TestClock` — Deterministic clock with manual `advance()`
 - `InMemoryPersistence` — In-memory save/load for testing
 - `TestState` / `TestDeltaState` — Example state implementations
 
+The `dstate-integration` crate provides higher-level test infrastructure
+(`MockCluster`, `MockTransport`, fault injection interceptors) for
+multi-node integration scenarios. For actor-level testing, see
+[`dactor-mock`](https://crates.io/crates/dactor-mock) which provides an
+in-memory mock cluster with fault injection at the actor framework layer.
+
 ```rust
-use dstate::test_support::{TestRuntime, InMemoryPersistence};
-use dstate::Clock;
+use dstate::test_support::test_runtime::TestClusterEvents;
 use dstate::test_support::test_clock::TestClock;
+use dstate::Clock;
 ```
 
 Run all tests:
@@ -143,6 +131,19 @@ Run all tests:
 ```bash
 cargo test --workspace
 ```
+
+## Migrating from v0.1
+
+v1.0 removes the adapter crate pattern (`dstate-ractor`, `dstate-kameo`).
+Instead, use `dactor` adapter crates directly:
+
+| v0.1 | v1.0 |
+|------|------|
+| `dstate` + `dstate-ractor` | `dstate` + `dactor-ractor` |
+| `dstate` + `dstate-kameo` | `dstate` + `dactor-kameo` |
+| `dstate::ActorRuntime` trait | Removed — use `dactor` directly |
+| `dstate::ActorRef<M>` trait | Removed — use `dactor::ActorRef<A>` |
+| `dstate::NodeId(u64)` | `dstate::NodeId(String)` (re-exported from dactor) |
 
 ## License
 

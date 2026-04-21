@@ -38,7 +38,7 @@ fn err_02_type_mismatch_propagates_through_query_error() {
 #[test]
 fn stale_peer_error_includes_node_id() {
     let err = QueryError::StalePeer {
-        node_id: NodeId(42),
+        node_id: NodeId("42".to_string()),
         reason: "unreachable".into(),
     };
     let msg = format!("{err}");

@@ -101,13 +101,13 @@ where
         );
 
         // Announce new node to all existing nodes; collect actions first
-        let existing_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        let existing_ids: Vec<NodeId> = self.nodes.keys().cloned().collect();
         let mut all_actions: Vec<(NodeId, Vec<EngineAction>)> = Vec::new();
-        for &existing_id in &existing_ids {
-            let node = self.nodes.get_mut(&existing_id).unwrap();
-            let actions = node.engine.on_node_joined(new_id, default_view.clone());
+        for existing_id in &existing_ids {
+            let node = self.nodes.get_mut(existing_id).unwrap();
+            let actions = node.engine.on_node_joined(new_id.clone(), default_view.clone());
             if !actions.is_empty() {
-                all_actions.push((existing_id, actions));
+                all_actions.push((existing_id.clone(), actions));
             }
         }
         for (node_id, actions) in all_actions {
@@ -133,20 +133,20 @@ where
 
         // Announce existing nodes to the new node; collect actions first
         let mut new_node_actions: Vec<Vec<EngineAction>> = Vec::new();
-        for &existing_id in &existing_ids {
+        for existing_id in &existing_ids {
             let actions = new_node
                 .engine
-                .on_node_joined(existing_id, default_view.clone());
+                .on_node_joined(existing_id.clone(), default_view.clone());
             if !actions.is_empty() {
                 new_node_actions.push(actions);
             }
         }
 
-        self.nodes.insert(new_id, new_node);
+        self.nodes.insert(new_id.clone(), new_node);
 
         // Route new node's actions after insertion
         for actions in new_node_actions {
-            self.route_actions(new_id, &actions);
+            self.route_actions(new_id.clone(), &actions);
         }
     }
 
@@ -155,7 +155,7 @@ where
     pub fn remove_node(&mut self, node_id: NodeId) {
         self.nodes.remove(&node_id);
         for (_, node) in &mut self.nodes {
-            node.engine.on_node_left(node_id);
+            node.engine.on_node_left(node_id.clone());
         }
     }
 
@@ -163,9 +163,9 @@ where
     /// (simulates hard crash where queued messages are lost).
     pub fn remove_node_hard(&mut self, node_id: NodeId) {
         self.nodes.remove(&node_id);
-        self.transport.drop_in_flight_for(node_id);
+        self.transport.drop_in_flight_for(node_id.clone());
         for (_, node) in &mut self.nodes {
-            node.engine.on_node_left(node_id);
+            node.engine.on_node_left(node_id.clone());
         }
     }
 
@@ -189,9 +189,9 @@ where
         }
 
         // Phase 2: Evaluate scheduled timer events
-        let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
-        for &node_id in &node_ids {
-            let node = self.nodes.get_mut(&node_id).unwrap();
+        let node_ids: Vec<NodeId> = self.nodes.keys().cloned().collect();
+        for node_id in &node_ids {
+            let node = self.nodes.get_mut(node_id).unwrap();
             let mut due = Vec::new();
             let mut remaining = Vec::new();
             for action in node.scheduled.drain(..) {
@@ -206,7 +206,7 @@ where
             for action in due {
                 let all_nodes = self.all_node_ids();
                 self.transport.broadcast(
-                    node_id,
+                    node_id.clone(),
                     &WireMessage::Sync(action.message),
                     &all_nodes,
                 );
@@ -216,8 +216,8 @@ where
         // Phase 3: Flush change feeds
         // Only advance the flush counter while there are pending feed items,
         // so idle time doesn't consume the batch interval.
-        for &node_id in &node_ids {
-            let node = self.nodes.get_mut(&node_id).unwrap();
+        for node_id in &node_ids {
+            let node = self.nodes.get_mut(node_id).unwrap();
             if node.engine.pending_change_feed_count() > 0 {
                 node.feed_flush_counter += 1;
                 if node.feed_flush_counter >= node.feed_flush_interval {
@@ -225,7 +225,7 @@ where
                     if let Some(feed) = node.engine.flush_change_feed() {
                         let all_nodes = self.all_node_ids();
                         self.transport
-                            .broadcast(node_id, &WireMessage::Feed(feed), &all_nodes);
+                            .broadcast(node_id.clone(), &WireMessage::Feed(feed), &all_nodes);
                     }
                 }
             } else {
@@ -310,7 +310,7 @@ where
 
     /// All node IDs in the cluster, sorted.
     pub fn all_node_ids(&self) -> Vec<NodeId> {
-        self.nodes.keys().copied().collect()
+        self.nodes.keys().cloned().collect()
     }
 
     /// Number of nodes in the cluster.
@@ -358,11 +358,11 @@ where
             match action {
                 EngineAction::BroadcastSync(msg) => {
                     self.transport
-                        .broadcast(from, &WireMessage::Sync(msg.clone()), &all_nodes);
+                        .broadcast(from.clone(), &WireMessage::Sync(msg.clone()), &all_nodes);
                 }
                 EngineAction::SendSync { target, message } => {
                     self.transport
-                        .send(from, *target, &WireMessage::Sync(message.clone()));
+                        .send(from.clone(), target.clone(), &WireMessage::Sync(message.clone()));
                 }
                 EngineAction::ScheduleDelayed { delay, message } => {
                     let delay_ms = delay.as_millis() as u64;
@@ -391,7 +391,7 @@ where
 impl MockCluster<TestState, TestState> {
     /// Create a cluster of `n` nodes using `TestState` (simple state).
     ///
-    /// Each node gets NodeId(0) through NodeId(n-1).
+    /// Each node gets NodeId("0".to_string()) through NodeId(n-1).
     pub fn with_test_state(n: usize, config: StateConfig) -> Self {
         let clock = Arc::new(TestClock::with_base_unix_ms(1_000_000));
         let tick_duration = Duration::from_millis(100);
@@ -400,7 +400,7 @@ impl MockCluster<TestState, TestState> {
         for i in 0..n {
             let engine = DistributedStateEngine::new(
                 TestState::name(),
-                NodeId(i as u64),
+                NodeId(i.to_string()),
                 TestState::default(),
                 |s| s.clone(),
                 config.clone(),
@@ -440,7 +440,7 @@ mod tests {
 
         // Each node should see 3 views (self + 2 peers)
         for id in 0..3 {
-            assert_eq!(cluster.engine(NodeId(id)).view_count(), 3);
+            assert_eq!(cluster.engine(NodeId(id.to_string())).view_count(), 3);
         }
     }
 
@@ -450,7 +450,7 @@ mod tests {
 
         // Mutate on node 0
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| {
                 s.counter = 42;
                 s.label = "hello".into();
@@ -465,7 +465,7 @@ mod tests {
 
         // All nodes should see node 0's update
         for id in 0..3 {
-            let view = cluster.engine(NodeId(id)).get_view(&NodeId(0)).unwrap();
+            let view = cluster.engine(NodeId(id.to_string())).get_view(&NodeId("0".to_string())).unwrap();
             assert_eq!(view.value.counter, 42);
             assert_eq!(view.value.label, "hello");
         }
@@ -478,7 +478,7 @@ mod tests {
         // Each node mutates its own state
         for i in 0..3 {
             cluster.mutate(
-                NodeId(i),
+                NodeId(i.to_string()),
                 |s| {
                     s.counter = (i + 1) * 10;
                     s.label = format!("node{i}");
@@ -494,8 +494,8 @@ mod tests {
         for observer in 0..3u64 {
             for origin in 0..3u64 {
                 let view = cluster
-                    .engine(NodeId(observer))
-                    .get_view(&NodeId(origin))
+                    .engine(NodeId(observer.to_string()))
+                    .get_view(&NodeId(origin.to_string()))
                     .unwrap();
                 assert_eq!(view.value.counter, (origin + 1) * 10);
                 assert_eq!(view.value.label, format!("node{origin}"));
@@ -509,19 +509,19 @@ mod tests {
         cluster.settle();
 
         // Remove node 2
-        cluster.remove_node(NodeId(2));
+        cluster.remove_node(NodeId("2".to_string()));
         assert_eq!(cluster.node_count(), 2);
 
         // Mutate on node 0 — should only reach node 1
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| s.counter = 99,
             |s| s.clone(),
             SyncUrgency::Default,
         );
         cluster.settle();
 
-        let view = cluster.engine(NodeId(1)).get_view(&NodeId(0)).unwrap();
+        let view = cluster.engine(NodeId("1".to_string())).get_view(&NodeId("0".to_string())).unwrap();
         assert_eq!(view.value.counter, 99);
         // Node 2 is gone, so no assertion there
     }
@@ -536,11 +536,11 @@ mod tests {
         // Partition: node 0 cannot reach node 2 (symmetric)
         cluster
             .transport_mut()
-            .add_interceptor(Box::new(Partition::symmetric([NodeId(0)], [NodeId(2)])));
+            .add_interceptor(Box::new(Partition::symmetric([NodeId("0".to_string())], [NodeId("2".to_string())])));
 
         // Node 0 mutates
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| s.counter = 77,
             |s| s.clone(),
             SyncUrgency::Default,
@@ -548,11 +548,11 @@ mod tests {
         cluster.settle();
 
         // Node 1 should see the update (not partitioned)
-        let v1 = cluster.engine(NodeId(1)).get_view(&NodeId(0)).unwrap();
+        let v1 = cluster.engine(NodeId("1".to_string())).get_view(&NodeId("0".to_string())).unwrap();
         assert_eq!(v1.value.counter, 77);
 
         // Node 2 should NOT see the update (partitioned from node 0)
-        let v2 = cluster.engine(NodeId(2)).get_view(&NodeId(0)).unwrap();
+        let v2 = cluster.engine(NodeId("2".to_string())).get_view(&NodeId("0".to_string())).unwrap();
         assert_eq!(v2.value.counter, 0); // still default
     }
 
@@ -566,11 +566,11 @@ mod tests {
         // Partition
         cluster
             .transport_mut()
-            .add_interceptor(Box::new(Partition::symmetric([NodeId(0)], [NodeId(1)])));
+            .add_interceptor(Box::new(Partition::symmetric([NodeId("0".to_string())], [NodeId("1".to_string())])));
 
         // Mutate during partition
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| s.counter = 100,
             |s| s.clone(),
             SyncUrgency::Default,
@@ -578,7 +578,7 @@ mod tests {
         cluster.settle();
 
         // Node 1 doesn't see it
-        let v = cluster.engine(NodeId(1)).get_view(&NodeId(0)).unwrap();
+        let v = cluster.engine(NodeId("1".to_string())).get_view(&NodeId("0".to_string())).unwrap();
         assert_eq!(v.value.counter, 0);
 
         // Heal partition
@@ -586,7 +586,7 @@ mod tests {
 
         // Mutate again — this broadcasts a new snapshot
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| s.counter = 200,
             |s| s.clone(),
             SyncUrgency::Default,
@@ -594,7 +594,7 @@ mod tests {
         cluster.settle();
 
         // Node 1 should now see the latest value
-        let v = cluster.engine(NodeId(1)).get_view(&NodeId(0)).unwrap();
+        let v = cluster.engine(NodeId("1".to_string())).get_view(&NodeId("0".to_string())).unwrap();
         assert_eq!(v.value.counter, 200);
     }
 
@@ -603,7 +603,7 @@ mod tests {
         let mut cluster = MockCluster::with_test_state(2, default_config());
 
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| s.counter = 1,
             |s| s.clone(),
             SyncUrgency::Default,
@@ -628,7 +628,7 @@ mod tests {
 
         // Mutate
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| s.counter = 42,
             |s| s.clone(),
             SyncUrgency::Default,
@@ -636,7 +636,7 @@ mod tests {
         cluster.settle();
 
         // Node 1 should have the correct value despite receiving duplicates
-        let v = cluster.engine(NodeId(1)).get_view(&NodeId(0)).unwrap();
+        let v = cluster.engine(NodeId("1".to_string())).get_view(&NodeId("0".to_string())).unwrap();
         assert_eq!(v.value.counter, 42);
     }
 
@@ -644,7 +644,7 @@ mod tests {
     fn single_node_cluster_settles_immediately() {
         let mut cluster = MockCluster::with_test_state(1, default_config());
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| s.counter = 1,
             |s| s.clone(),
             SyncUrgency::Default,
@@ -661,7 +661,7 @@ mod tests {
 
         // Mutate on node 0 — generates in-flight messages
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| s.counter = 42,
             |s| s.clone(),
             SyncUrgency::Default,
@@ -669,7 +669,7 @@ mod tests {
         assert!(cluster.in_flight_count() > 0);
 
         // Hard remove node 0 — should purge its in-flight messages
-        cluster.remove_node_hard(NodeId(0));
+        cluster.remove_node_hard(NodeId("0".to_string()));
         assert_eq!(cluster.in_flight_count(), 0);
     }
 
@@ -693,7 +693,7 @@ mod tests {
             .add_interceptor(Box::new(CorruptBytes::new(99)));
 
         cluster.mutate(
-            NodeId(0),
+            NodeId("0".to_string()),
             |s| s.counter = 1,
             |s| s.clone(),
             SyncUrgency::Default,

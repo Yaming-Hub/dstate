@@ -178,9 +178,9 @@ where
             modified_time: state.modified_time,
             synced_at: now,
             pending_remote_generation: None,
-            source_node: node_id,
+            source_node: node_id.clone(),
         };
-        let views = ViewMap::new(node_id, initial_vo);
+        let views = ViewMap::new(node_id.clone(), initial_vo);
 
         Self {
             node_id,
@@ -192,9 +192,14 @@ where
 
     // ── Accessors ───────────────────────────────────────────────
 
-    /// The local node's ID.
+    /// The local node's ID (borrowed).
+    pub fn node_id_ref(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    /// The local node's ID (owned clone).
     pub fn node_id(&self) -> NodeId {
-        self.node_id
+        self.node_id.clone()
     }
 
     /// Access the clock used by this shard.
@@ -449,7 +454,7 @@ where
                 modified_time: snap.modified_time,
                 synced_at: now,
                 pending_remote_generation: pending,
-                source_node: source,
+                source_node: source.clone(),
             })
         });
 
@@ -529,7 +534,7 @@ where
                 modified_time: self.clock.unix_ms(),
                 synced_at: now,
                 pending_remote_generation: pending,
-                source_node: source,
+                source_node: source.clone(),
             },
         );
 
@@ -541,7 +546,7 @@ where
     /// Return peers whose views are stale (not synced within `max_staleness`
     /// or have a `pending_remote_generation`).
     pub fn stale_peers(&self, max_staleness: Duration) -> Vec<NodeId> {
-        self.views.stale_peers(self.node_id, max_staleness, self.clock.as_ref())
+        self.views.stale_peers(&self.node_id, max_staleness, self.clock.as_ref())
     }
 
     /// Mark a peer's view as stale based on a change-feed notification.
@@ -581,7 +586,7 @@ where
         // Mark as stale so query path triggers a pull for the real state.
         let pending = Some(Generation::new(1, 0));
         self.views.insert_node(
-            node_id,
+            node_id.clone(),
             StateViewObject {
                 generation: Generation::zero(),
                 wire_version: 0,
@@ -636,7 +641,7 @@ where
                 view.pending_remote_generation.is_some()
                     || now.duration_since(view.synced_at) > max_staleness
             })
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id.clone())
             .collect();
 
         let result = project(&snapshot);
@@ -664,7 +669,7 @@ where
                 modified_time: self.state.modified_time,
                 synced_at: now,
                 pending_remote_generation: None,
-                source_node: self.node_id,
+                source_node: self.node_id.clone(),
             },
         );
     }
@@ -720,7 +725,7 @@ mod tests {
     fn make_shard(clock: Arc<dyn Clock>) -> ShardCore<TestState, TestState> {
         let state = make_state_object(0, "init", clock.as_ref());
         let view = state.value.clone();
-        ShardCore::new(NodeId(1), state, view, clock)
+        ShardCore::new(NodeId("1".to_string()), state, view, clock)
     }
 
     fn make_delta_shard(
@@ -734,7 +739,7 @@ mod tests {
             modified_time: clock.unix_ms(),
         };
         let view = TestDeltaState::project_view(&state.value);
-        ShardCore::new(NodeId(1), state, view, clock)
+        ShardCore::new(NodeId("1".to_string()), state, view, clock)
     }
 
     // ── TEST-05: should_accept ordering ─────────────────────────
@@ -787,14 +792,14 @@ mod tests {
         let shard = make_shard(clock.clone());
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
         // Peer is stale immediately after join (placeholder has pending_remote_generation).
-        assert_eq!(shard.stale_peers(Duration::from_secs(10)), vec![NodeId(2)]);
+        assert_eq!(shard.stale_peers(Duration::from_secs(10)), vec![NodeId("2".to_string())]);
 
         // Accept a snapshot to clear the stale marker.
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 1),
             wire_version: 1,
             view: TestState { counter: 1, label: "synced".into() },
@@ -808,7 +813,7 @@ mod tests {
         // Advance clock past staleness threshold.
         clock.advance(Duration::from_secs(15));
         let stale = shard.stale_peers(Duration::from_secs(10));
-        assert_eq!(stale, vec![NodeId(2)]);
+        assert_eq!(stale, vec![NodeId("2".to_string())]);
     }
 
     #[test]
@@ -817,12 +822,12 @@ mod tests {
         let shard = make_shard(clock.clone());
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
-        shard.mark_stale(NodeId(2), 1, 5);
+        shard.mark_stale(NodeId("2".to_string()), 1, 5);
 
         let stale = shard.stale_peers(Duration::from_secs(3600));
-        assert_eq!(stale, vec![NodeId(2)]);
+        assert_eq!(stale, vec![NodeId("2".to_string())]);
     }
 
     #[test]
@@ -858,7 +863,7 @@ mod tests {
         let clock = test_clock();
         let shard = make_shard(clock);
         let snap = shard.snapshot();
-        assert!(snap.contains_key(&NodeId(1)));
+        assert!(snap.contains_key(&NodeId("1".to_string())));
         assert_eq!(snap.len(), 1);
     }
 
@@ -869,7 +874,7 @@ mod tests {
         let clock = test_clock();
         let shard = make_shard(clock);
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(1)).unwrap();
+        let entry = snap.get(&NodeId("1".to_string())).unwrap();
         assert_eq!(entry.generation.age, 0);
         assert_eq!(entry.generation.incarnation, 1);
         assert_eq!(entry.value.counter, 0);
@@ -884,7 +889,7 @@ mod tests {
         let shard = make_shard(clock);
         let snap = shard.snapshot();
         assert_eq!(snap.len(), 1);
-        assert!(snap.contains_key(&NodeId(1)));
+        assert!(snap.contains_key(&NodeId("1".to_string())));
     }
 
     // ── SHARD-01: Mutation increments age ───────────────────────
@@ -958,12 +963,12 @@ mod tests {
         let shard = make_shard(clock);
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
         let snap = shard.snapshot();
         assert_eq!(snap.len(), 2);
-        assert!(snap.contains_key(&NodeId(2)));
-        assert_eq!(snap[&NodeId(2)].generation.age, 0);
+        assert!(snap.contains_key(&NodeId("2".to_string())));
+        assert_eq!(snap[&NodeId("2".to_string())].generation.age, 0);
     }
 
     // ── SHARD-06: on_node_left removes entry ────────────────────
@@ -974,12 +979,12 @@ mod tests {
         let shard = make_shard(clock);
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
         assert_eq!(shard.snapshot().len(), 2);
 
-        shard.on_node_left(NodeId(2));
+        shard.on_node_left(NodeId("2".to_string()));
         assert_eq!(shard.snapshot().len(), 1);
-        assert!(!shard.snapshot().contains_key(&NodeId(2)));
+        assert!(!shard.snapshot().contains_key(&NodeId("2".to_string())));
     }
 
     // ── SHARD-07: MarkStale sets pending_remote_age ─────────────
@@ -990,12 +995,12 @@ mod tests {
         let shard = make_shard(clock);
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
-        shard.mark_stale(NodeId(2), 1, 10);
+        shard.mark_stale(NodeId("2".to_string()), 1, 10);
 
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(2)).unwrap();
+        let entry = snap.get(&NodeId("2".to_string())).unwrap();
         assert_eq!(entry.pending_remote_generation, Some(Generation::new(1, 10)));
     }
 
@@ -1007,7 +1012,7 @@ mod tests {
         let shard = make_shard(clock);
 
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(5, 10),
             wire_version: 1,
             view: TestState { counter: 10, label: "peer".into() },
@@ -1015,10 +1020,10 @@ mod tests {
             modified_time: 1_000_000,
         });
 
-        shard.mark_stale(NodeId(2), 3, 20);
+        shard.mark_stale(NodeId("2".to_string()), 3, 20);
 
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(2)).unwrap();
+        let entry = snap.get(&NodeId("2".to_string())).unwrap();
         assert_eq!(entry.pending_remote_generation, None);
     }
 
@@ -1030,14 +1035,14 @@ mod tests {
         let shard = make_shard(clock);
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view.clone());
-        shard.on_node_joined(NodeId(3), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view.clone());
+        shard.on_node_joined(NodeId("3".to_string()), default_view);
 
         let snap = shard.snapshot();
         assert_eq!(snap.len(), 3);
-        assert!(snap.contains_key(&NodeId(1)));
-        assert!(snap.contains_key(&NodeId(2)));
-        assert!(snap.contains_key(&NodeId(3)));
+        assert!(snap.contains_key(&NodeId("1".to_string())));
+        assert!(snap.contains_key(&NodeId("2".to_string())));
+        assert!(snap.contains_key(&NodeId("3".to_string())));
     }
 
     // ── MUT-01: Mutation closure receives mutable state ─────────
@@ -1069,7 +1074,7 @@ mod tests {
         shard.apply_mutation(|s| s.counter = 42, |s| s.clone());
 
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(1)).unwrap();
+        let entry = snap.get(&NodeId("1".to_string())).unwrap();
         assert_eq!(entry.value.counter, 42);
         assert_eq!(entry.generation.age, 1);
     }
@@ -1116,10 +1121,10 @@ mod tests {
         let shard = make_shard(clock);
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
         let result = shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestState { counter: 50, label: "from-peer".into() },
@@ -1129,7 +1134,7 @@ mod tests {
 
         assert_eq!(result, AcceptResult::Accepted);
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(2)).unwrap();
+        let entry = snap.get(&NodeId("2".to_string())).unwrap();
         assert_eq!(entry.value.counter, 50);
         assert_eq!(entry.generation.age, 5);
     }
@@ -1142,7 +1147,7 @@ mod tests {
         let shard = make_shard(clock);
 
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 10),
             wire_version: 1,
             view: TestState { counter: 10, label: "new".into() },
@@ -1151,7 +1156,7 @@ mod tests {
         });
 
         let result = shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestState { counter: 5, label: "old".into() },
@@ -1161,7 +1166,7 @@ mod tests {
 
         assert_eq!(result, AcceptResult::Discarded);
         let snap = shard.snapshot();
-        assert_eq!(snap[&NodeId(2)].value.counter, 10);
+        assert_eq!(snap[&NodeId("2".to_string())].value.counter, 10);
     }
 
     // ── DMUT-01: mutate_with_delta captures StateDeltaChange ────
@@ -1245,7 +1250,7 @@ mod tests {
         );
 
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(1)).unwrap();
+        let entry = snap.get(&NodeId("1".to_string())).unwrap();
         assert_eq!(entry.value.counter, 42);
         assert_eq!(entry.value.label, "projected");
     }
@@ -1328,7 +1333,7 @@ mod tests {
         let shard: ShardCore<TestDeltaStateInner, TestDeltaView> = make_delta_shard(clock);
 
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestDeltaView { counter: 10, label: "peer".into() },
@@ -1338,7 +1343,7 @@ mod tests {
 
         // Delta advances from age 5 to age 6: generation = (1, 6).
         let result = shard.accept_inbound_delta(
-            NodeId(2), Generation::new(1, 6), 1,
+            NodeId("2".to_string()), Generation::new(1, 6), 1,
             |view| TestDeltaState::apply_delta(
                 view,
                 &TestDeltaViewDelta { counter_delta: 3, new_label: None },
@@ -1347,8 +1352,8 @@ mod tests {
 
         assert_eq!(result, DeltaAcceptResult::Applied);
         let snap = shard.snapshot();
-        assert_eq!(snap[&NodeId(2)].value.counter, 13);
-        assert_eq!(snap[&NodeId(2)].generation.age, 6);
+        assert_eq!(snap[&NodeId("2".to_string())].value.counter, 13);
+        assert_eq!(snap[&NodeId("2".to_string())].generation.age, 6);
     }
 
     #[test]
@@ -1357,7 +1362,7 @@ mod tests {
         let shard: ShardCore<TestDeltaStateInner, TestDeltaView> = make_delta_shard(clock);
 
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestDeltaView { counter: 10, label: "peer".into() },
@@ -1367,7 +1372,7 @@ mod tests {
 
         // Peer is at age 5 but delta claims generation (1, 8) — gap (skipped ages).
         let result = shard.accept_inbound_delta(
-            NodeId(2), Generation::new(1, 8), 1,
+            NodeId("2".to_string()), Generation::new(1, 8), 1,
             |_| unreachable!(),
         );
 
@@ -1383,7 +1388,7 @@ mod tests {
         let shard: ShardCore<TestDeltaStateInner, TestDeltaView> = make_delta_shard(clock);
 
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(2, 10),
             wire_version: 1,
             view: TestDeltaView { counter: 10, label: "peer".into() },
@@ -1393,7 +1398,7 @@ mod tests {
 
         // Delta from old incarnation 1 but peer is at incarnation 2.
         let result = shard.accept_inbound_delta(
-            NodeId(2), Generation::new(1, 10), 1,
+            NodeId("2".to_string()), Generation::new(1, 10), 1,
             |_| unreachable!(),
         );
 
@@ -1406,7 +1411,7 @@ mod tests {
         let shard: ShardCore<TestDeltaStateInner, TestDeltaView> = make_delta_shard(clock);
 
         let result = shard.accept_inbound_delta(
-            NodeId(99), Generation::new(1, 1), 1,
+            NodeId("99".to_string()), Generation::new(1, 1), 1,
             |_| unreachable!(),
         );
 
@@ -1421,7 +1426,7 @@ mod tests {
         let shard = make_shard(clock);
 
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestState { counter: 5, label: "peer".into() },
@@ -1429,10 +1434,10 @@ mod tests {
             modified_time: 1_000_000,
         });
 
-        shard.mark_stale(NodeId(2), 2, 3);
+        shard.mark_stale(NodeId("2".to_string()), 2, 3);
 
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(2)).unwrap();
+        let entry = snap.get(&NodeId("2".to_string())).unwrap();
         assert_eq!(entry.pending_remote_generation, Some(Generation::new(2, 3)));
     }
 
@@ -1444,8 +1449,8 @@ mod tests {
         let shard = make_shard(clock);
         let default_view = TestState { counter: 0, label: String::new() };
 
-        shard.on_node_joined(NodeId(2), default_view.clone());
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view.clone());
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
         assert_eq!(shard.snapshot().len(), 2);
     }
@@ -1456,7 +1461,7 @@ mod tests {
     fn node_left_unknown_noop() {
         let clock = test_clock();
         let shard = make_shard(clock);
-        shard.on_node_left(NodeId(99));
+        shard.on_node_left(NodeId("99".to_string()));
         assert_eq!(shard.snapshot().len(), 1);
     }
 
@@ -1468,7 +1473,7 @@ mod tests {
         let shard = make_shard(clock);
 
         let result = shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(5),
+            source: NodeId("5".to_string()),
             generation: Generation::new(1, 1),
             wire_version: 1,
             view: TestState { counter: 1, label: "new".into() },
@@ -1478,7 +1483,7 @@ mod tests {
 
         assert_eq!(result, AcceptResult::Accepted);
         assert_eq!(shard.snapshot().len(), 2);
-        assert_eq!(shard.snapshot()[&NodeId(5)].value.counter, 1);
+        assert_eq!(shard.snapshot()[&NodeId("5".to_string())].value.counter, 1);
     }
 
     // ── Additional: accept snapshot clears pending_remote ───────
@@ -1489,13 +1494,13 @@ mod tests {
         let shard = make_shard(clock);
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
-        shard.mark_stale(NodeId(2), 1, 10);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
+        shard.mark_stale(NodeId("2".to_string()), 1, 10);
 
-        assert!(shard.snapshot()[&NodeId(2)].pending_remote_generation.is_some());
+        assert!(shard.snapshot()[&NodeId("2".to_string())].pending_remote_generation.is_some());
 
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 10),
             wire_version: 1,
             view: TestState { counter: 10, label: "fresh".into() },
@@ -1504,7 +1509,7 @@ mod tests {
         });
 
         let snap = shard.snapshot();
-        assert_eq!(snap[&NodeId(2)].pending_remote_generation, None);
+        assert_eq!(snap[&NodeId("2".to_string())].pending_remote_generation, None);
     }
 
     // ── Partial catch-up preserves pending_remote_generation ────
@@ -1515,13 +1520,13 @@ mod tests {
         let shard = make_shard(clock);
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
         // Change feed says peer is at generation (1, 10).
-        shard.mark_stale(NodeId(2), 1, 10);
+        shard.mark_stale(NodeId("2".to_string()), 1, 10);
 
         // Accept a delayed snapshot at generation (1, 6) — still behind.
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 6),
             wire_version: 1,
             view: TestState { counter: 6, label: "partial".into() },
@@ -1531,8 +1536,8 @@ mod tests {
 
         let snap = shard.snapshot();
         // pending_remote_generation should be preserved — we're not caught up yet.
-        assert_eq!(snap[&NodeId(2)].pending_remote_generation, Some(Generation::new(1, 10)));
-        assert_eq!(snap[&NodeId(2)].value.counter, 6);
+        assert_eq!(snap[&NodeId("2".to_string())].pending_remote_generation, Some(Generation::new(1, 10)));
+        assert_eq!(snap[&NodeId("2".to_string())].value.counter, 6);
     }
 
     // ── Delta partial catch-up preserves pending_remote_generation ──
@@ -1543,11 +1548,11 @@ mod tests {
         let shard = make_delta_shard(clock.clone());
 
         let default_view = TestDeltaView { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
         // Accept snapshot to establish baseline at (1, 5).
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestDeltaView { counter: 5, label: "base".into() },
@@ -1556,17 +1561,17 @@ mod tests {
         });
 
         // Change feed says peer is at (1, 10).
-        shard.mark_stale(NodeId(2), 1, 10);
+        shard.mark_stale(NodeId("2".to_string()), 1, 10);
 
         // Apply delta advancing to (1, 6) — still behind (1, 10).
         let result = shard.accept_inbound_delta(
-            NodeId(2), Generation::new(1, 6), 1,
+            NodeId("2".to_string()), Generation::new(1, 6), 1,
             |v| TestDeltaView { counter: v.counter + 1, label: v.label.clone() },
         );
         assert_eq!(result, DeltaAcceptResult::Applied);
 
         let snap = shard.snapshot();
-        assert_eq!(snap[&NodeId(2)].pending_remote_generation, Some(Generation::new(1, 10)));
+        assert_eq!(snap[&NodeId("2".to_string())].pending_remote_generation, Some(Generation::new(1, 10)));
     }
 
     // ── on_node_joined marks placeholder as stale ──────────────
@@ -1577,10 +1582,10 @@ mod tests {
         let shard = make_shard(clock);
 
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(2)).unwrap();
+        let entry = snap.get(&NodeId("2".to_string())).unwrap();
         // Placeholder should have pending_remote_generation set (marked stale).
         assert!(entry.pending_remote_generation.is_some());
         assert_eq!(entry.generation, Generation::zero());
@@ -1615,11 +1620,11 @@ mod tests {
 
         // Simulate a peer joining.
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
         // Build a SyncMessage::FullSnapshot as if received over the wire,
         // then extract its fields into an InboundSnapshot.
-        let source_node = NodeId(2);
+        let source_node = NodeId("2".to_string());
         let gen = Generation::new(1, 7);
         let view = TestState { counter: 42, label: "wire-snap".into() };
         let wire_version = TestState::WIRE_VERSION;
@@ -1635,7 +1640,7 @@ mod tests {
 
         assert_eq!(result, AcceptResult::Accepted);
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(2)).unwrap();
+        let entry = snap.get(&NodeId("2".to_string())).unwrap();
         assert_eq!(entry.generation, gen);
         assert_eq!(entry.value.counter, 42);
         assert_eq!(entry.value.label, "wire-snap");
@@ -1650,10 +1655,10 @@ mod tests {
 
         // Join peer and accept baseline snapshot at (1, 5).
         let default_view = TestDeltaView { counter: 0, label: String::new() };
-        shard.on_node_joined(NodeId(2), default_view);
+        shard.on_node_joined(NodeId("2".to_string()), default_view);
 
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestDeltaView { counter: 100, label: "baseline".into() },
@@ -1663,7 +1668,7 @@ mod tests {
 
         // Simulate receiving a DeltaUpdate: generation advances to (1, 6).
         let result = shard.accept_inbound_delta(
-            NodeId(2),
+            NodeId("2".to_string()),
             Generation::new(1, 6),
             1,
             |v| TestDeltaView { counter: v.counter + 5, label: v.label.clone() },
@@ -1671,8 +1676,8 @@ mod tests {
 
         assert_eq!(result, DeltaAcceptResult::Applied);
         let snap = shard.snapshot();
-        assert_eq!(snap[&NodeId(2)].generation, Generation::new(1, 6));
-        assert_eq!(snap[&NodeId(2)].value.counter, 105);
+        assert_eq!(snap[&NodeId("2".to_string())].generation, Generation::new(1, 6));
+        assert_eq!(snap[&NodeId("2".to_string())].value.counter, 105);
     }
 
     // ── WIRE-07: Change feed marks peer stale ───────────────────
@@ -1684,7 +1689,7 @@ mod tests {
 
         // Accept a snapshot from peer at (1, 5).
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestState { counter: 5, label: "peer".into() },
@@ -1694,10 +1699,10 @@ mod tests {
 
         // Simulate a BatchedChangeFeed with a ChangeNotification at (1, 10).
         // The actor shell would call mark_stale on the shard.
-        shard.mark_stale(NodeId(2), 1, 10);
+        shard.mark_stale(NodeId("2".to_string()), 1, 10);
 
         let snap = shard.snapshot();
-        let entry = snap.get(&NodeId(2)).unwrap();
+        let entry = snap.get(&NodeId("2".to_string())).unwrap();
         assert_eq!(entry.pending_remote_generation, Some(Generation::new(1, 10)));
         // The view value should still be the old snapshot (not yet updated).
         assert_eq!(entry.value.counter, 5);
@@ -1725,8 +1730,8 @@ mod tests {
         assert_eq!(state.generation.incarnation, 1);
 
         let snap = shard.snapshot();
-        assert_eq!(snap[&NodeId(1)].value.counter, 30);
-        assert_eq!(snap[&NodeId(1)].generation.age, 3);
+        assert_eq!(snap[&NodeId("1".to_string())].value.counter, 30);
+        assert_eq!(snap[&NodeId("1".to_string())].generation.age, 3);
     }
 
     // ── WIRE-09: Unknown peer snapshot accepted ─────────────────
@@ -1736,10 +1741,10 @@ mod tests {
         let clock = test_clock();
         let shard = make_shard(clock);
 
-        // No prior NodeJoined for NodeId(99) — accept_inbound_snapshot
+        // No prior NodeJoined for NodeId("99".to_string()) — accept_inbound_snapshot
         // should handle this via update_if which upserts.
         let result = shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(99),
+            source: NodeId("99".to_string()),
             generation: Generation::new(3, 15),
             wire_version: 1,
             view: TestState { counter: 999, label: "unknown-peer".into() },
@@ -1751,7 +1756,7 @@ mod tests {
         let snap = shard.snapshot();
         // Should have created a new entry (self + unknown peer).
         assert_eq!(snap.len(), 2);
-        let entry = snap.get(&NodeId(99)).unwrap();
+        let entry = snap.get(&NodeId("99".to_string())).unwrap();
         assert_eq!(entry.value.counter, 999);
         assert_eq!(entry.value.label, "unknown-peer");
         assert_eq!(entry.generation, Generation::new(3, 15));
@@ -1764,9 +1769,9 @@ mod tests {
     /// Helper: add a peer with a fresh snapshot at a given generation.
     fn add_fresh_peer(shard: &ShardCore<TestState, TestState>, node_id: NodeId, counter: u64, clock: &dyn Clock) {
         let default_view = TestState { counter: 0, label: String::new() };
-        shard.on_node_joined(node_id, default_view);
+        shard.on_node_joined(node_id.clone(), default_view);
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: node_id,
+            source: node_id.clone(),
             generation: Generation::new(1, 1),
             wire_version: 1,
             view: TestState { counter, label: format!("peer-{}", node_id.0) },
@@ -1782,9 +1787,9 @@ mod tests {
         let clock = test_clock();
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
-        add_fresh_peer(&shard, NodeId(3), 20, clock.as_ref());
-        add_fresh_peer(&shard, NodeId(4), 30, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("3".to_string()), 20, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("4".to_string()), 30, clock.as_ref());
 
         let result = shard.query_local(Duration::from_secs(5), |snap| {
             snap.len()
@@ -1804,7 +1809,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(tc.clone());
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 10, clock.as_ref());
 
         // Advance time beyond max_staleness.
         tc.advance(Duration::from_secs(10));
@@ -1815,7 +1820,7 @@ mod tests {
 
         match result {
             QueryResult::StalePeersDetected { stale_peers, result } => {
-                assert_eq!(stale_peers, vec![NodeId(2)]);
+                assert_eq!(stale_peers, vec![NodeId("2".to_string())]);
                 assert_eq!(result, 2);
             }
             QueryResult::Fresh(_) => panic!("expected stale detection"),
@@ -1830,8 +1835,8 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(tc.clone());
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
-        add_fresh_peer(&shard, NodeId(3), 20, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("3".to_string()), 20, clock.as_ref());
 
         // Advance time but stay within max_staleness.
         tc.advance(Duration::from_secs(2));
@@ -1853,7 +1858,7 @@ mod tests {
         let clock = test_clock();
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 42, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 42, clock.as_ref());
 
         let result = shard.query_local(Duration::from_secs(5), |snap| {
             snap.values()
@@ -1875,14 +1880,14 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(tc.clone());
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
-        add_fresh_peer(&shard, NodeId(3), 20, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("3".to_string()), 20, clock.as_ref());
 
         // Only peer 2 goes stale.
         tc.advance(Duration::from_secs(6));
         // Re-sync peer 3 so it's fresh.
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(3),
+            source: NodeId("3".to_string()),
             generation: Generation::new(1, 2),
             wire_version: 1,
             view: TestState { counter: 25, label: "refreshed".into() },
@@ -1891,12 +1896,12 @@ mod tests {
         });
 
         let result = shard.query_local(Duration::from_secs(5), |snap| {
-            snap[&NodeId(3)].value.counter
+            snap[&NodeId("3".to_string())].value.counter
         });
 
         match result {
             QueryResult::StalePeersDetected { stale_peers, result } => {
-                assert_eq!(stale_peers, vec![NodeId(2)]);
+                assert_eq!(stale_peers, vec![NodeId("2".to_string())]);
                 assert_eq!(result, 25);
             }
             QueryResult::Fresh(_) => panic!("expected stale detection for peer 2"),
@@ -1910,18 +1915,18 @@ mod tests {
         let clock = test_clock();
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 10, clock.as_ref());
 
         // Simulate change feed notification: peer 2 is now at generation (1, 5).
-        shard.mark_stale(NodeId(2), 1, 5);
+        shard.mark_stale(NodeId("2".to_string()), 1, 5);
 
         let result = shard.query_local(Duration::from_secs(60), |snap| {
-            snap[&NodeId(2)].value.counter
+            snap[&NodeId("2".to_string())].value.counter
         });
 
         match result {
             QueryResult::StalePeersDetected { stale_peers, result } => {
-                assert_eq!(stale_peers, vec![NodeId(2)]);
+                assert_eq!(stale_peers, vec![NodeId("2".to_string())]);
                 assert_eq!(result, 10); // old value still visible
             }
             QueryResult::Fresh(_) => panic!("expected stale detection via pending_remote_generation"),
@@ -1936,9 +1941,9 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(tc.clone());
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
-        add_fresh_peer(&shard, NodeId(3), 20, clock.as_ref());
-        add_fresh_peer(&shard, NodeId(4), 30, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("3".to_string()), 20, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("4".to_string()), 30, clock.as_ref());
 
         // All peers go stale.
         tc.advance(Duration::from_secs(10));
@@ -1950,7 +1955,7 @@ mod tests {
         match result {
             QueryResult::StalePeersDetected { mut stale_peers, result } => {
                 stale_peers.sort();
-                assert_eq!(stale_peers, vec![NodeId(2), NodeId(3), NodeId(4)]);
+                assert_eq!(stale_peers, vec![NodeId("2".to_string()), NodeId("3".to_string()), NodeId("4".to_string())]);
                 assert_eq!(result, 4);
             }
             QueryResult::Fresh(_) => panic!("expected 3 stale peers"),
@@ -1965,7 +1970,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(tc.clone());
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 42, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 42, clock.as_ref());
 
         // Make it very stale.
         tc.advance(Duration::from_secs(3600));
@@ -1973,7 +1978,7 @@ mod tests {
         // snapshot() does not check freshness — returns whatever is there.
         let snap = shard.snapshot();
         assert_eq!(snap.len(), 2);
-        assert_eq!(snap[&NodeId(2)].value.counter, 42);
+        assert_eq!(snap[&NodeId("2".to_string())].value.counter, 42);
     }
 
     // ── QUERY: local node is never considered stale ─────────────
@@ -2097,19 +2102,19 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(tc.clone());
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 10, clock.as_ref());
 
         // First query: peer is stale.
         tc.advance(Duration::from_secs(10));
 
         let result = shard.query_local(Duration::from_secs(5), |snap| {
-            snap[&NodeId(2)].value.counter
+            snap[&NodeId("2".to_string())].value.counter
         });
         assert!(matches!(result, QueryResult::StalePeersDetected { .. }));
 
         // Simulate the actor shell pulling fresh data.
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestState { counter: 99, label: "refreshed".into() },
@@ -2119,7 +2124,7 @@ mod tests {
 
         // Second query: all fresh now.
         let result = shard.query_local(Duration::from_secs(5), |snap| {
-            snap[&NodeId(2)].value.counter
+            snap[&NodeId("2".to_string())].value.counter
         });
         match result {
             QueryResult::Fresh(counter) => assert_eq!(counter, 99),
@@ -2138,18 +2143,18 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(tc.clone());
         let shard = make_shard(clock.clone());
 
-        add_fresh_peer(&shard, NodeId(2), 10, clock.as_ref());
+        add_fresh_peer(&shard, NodeId("2".to_string()), 10, clock.as_ref());
         tc.advance(Duration::from_secs(10));
 
         // Multiple calls consistently report the same stale peer.
         let stale1 = shard.stale_peers(Duration::from_secs(5));
         let stale2 = shard.stale_peers(Duration::from_secs(5));
         assert_eq!(stale1, stale2);
-        assert_eq!(stale1, vec![NodeId(2)]);
+        assert_eq!(stale1, vec![NodeId("2".to_string())]);
 
         // After refresh, peer is no longer stale.
         shard.accept_inbound_snapshot(InboundSnapshot {
-            source: NodeId(2),
+            source: NodeId("2".to_string()),
             generation: Generation::new(1, 5),
             wire_version: 1,
             view: TestState { counter: 99, label: "refreshed".into() },
@@ -2206,7 +2211,7 @@ mod tests {
 
         // Simulate restart — create new shard from saved state
         let shard2 = ShardCore::new(
-            NodeId(1),
+            NodeId("1".to_string()),
             saved.clone(),
             saved.value.clone(),
             clock,
@@ -2283,7 +2288,7 @@ mod tests {
         let mut shard = make_shard(clock);
 
         shard.apply_mutation(|s| s.counter = 5, |s| s.clone());
-        let view_before = shard.get_view(&NodeId(1)).unwrap();
+        let view_before = shard.get_view(&NodeId("1".to_string())).unwrap();
         assert_eq!(view_before.value.counter, 5);
 
         // Prepare mutation but don't commit (save failure)
@@ -2291,7 +2296,7 @@ mod tests {
         drop(prepared);
 
         // View map still shows counter=5
-        let view_after = shard.get_view(&NodeId(1)).unwrap();
+        let view_after = shard.get_view(&NodeId("1".to_string())).unwrap();
         assert_eq!(view_after.value.counter, 5);
         assert_eq!(view_after.generation.age, 1);
     }
@@ -2328,7 +2333,7 @@ mod tests {
         let prepared = shard.prepare_mutation(|s| s.counter = 42, |s| s.clone());
         assert_eq!(shard.state().generation.age, 0, "state unchanged before commit");
         assert_eq!(
-            shard.get_view(&NodeId(1)).unwrap().value.counter, 0,
+            shard.get_view(&NodeId("1".to_string())).unwrap().value.counter, 0,
             "view unchanged before commit"
         );
 
@@ -2340,7 +2345,7 @@ mod tests {
         let outcome = shard.commit_mutation(prepared);
         assert_eq!(shard.state().generation.age, 1, "state updated after commit");
         assert_eq!(
-            shard.get_view(&NodeId(1)).unwrap().value.counter, 42,
+            shard.get_view(&NodeId("1".to_string())).unwrap().value.counter, 42,
             "view updated after commit"
         );
         assert_eq!(outcome.generation.age, 1);

@@ -11,23 +11,25 @@
 //!
 //! - [`DistributedState`] — Simple state where the entire value is the public view
 //! - [`DeltaDistributedState`] — State with separate view/delta projections
-//! - [`ActorRuntime`] — Actor spawning, timers, and processing groups
 //! - [`StatePersistence`] — Async save/load for crash recovery
 //! - [`Clock`] — Time abstraction for deterministic testing
 //!
-//! ## Adapter Crates
+//! ## Actor Runtime (via dactor)
 //!
-//! Use `dstate` with a concrete actor framework via an adapter:
-//! - [`dstate-ractor`](https://crates.io/crates/dstate-ractor) — ractor adapter
-//! - [`dstate-kameo`](https://crates.io/crates/dstate-kameo) — kameo adapter
+//! Actor spawning, messaging, timers, groups, and cluster events are provided
+//! by the [`dactor`](https://crates.io/crates/dactor) crate. Use `dactor`
+//! with a concrete backend (ractor, kameo, or coerce) via its adapter crates.
 
 // ── Traits (what users implement) ────────────────────────────────
 pub use traits::state::{DeltaDistributedState, DistributedState, SyncUrgency};
-pub use traits::runtime::{
-    ActorRef, ActorRuntime, ClusterEvent, ClusterEvents, TimerHandle,
-};
 pub use traits::persistence::{PersistError, StatePersistence};
 pub use traits::clock::{Clock, SystemClock};
+
+// ── Runtime abstractions (cluster events, timers, errors) ────────
+pub use traits::runtime::{
+    ActorSendError, ClusterError, ClusterEvent, ClusterEvents, GroupError,
+    SubscriptionId, TimerHandle,
+};
 
 // ── Types (what users construct / receive) ──────────────────────
 pub use types::envelope::{StateObject, StateViewObject};
@@ -35,9 +37,6 @@ pub use types::config::{ChangeFeedConfig, PushMode, StateConfig, SyncStrategy};
 pub use types::node::{NodeId, Generation, VersionMismatchPolicy};
 pub use types::errors::{
     DeserializeError, MutationError, QueryError, RegistryError,
-};
-pub use traits::runtime::{
-    ActorSendError, ClusterError, GroupError, SubscriptionId,
 };
 pub use types::sync_message::{BatchedChangeFeed, ChangeNotification, SyncMessage};
 

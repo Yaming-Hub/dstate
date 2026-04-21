@@ -2,14 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Unique identifier for a node in the cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct NodeId(pub u64);
-
-impl fmt::Display for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Node({})", self.0)
-    }
-}
+///
+/// Re-exported from `dactor::NodeId`. The inner value is a `String` to
+/// align with dactor's cluster identity model.
+pub use dactor::NodeId;
 
 /// Logical version of a state, used for ordering and staleness detection.
 ///

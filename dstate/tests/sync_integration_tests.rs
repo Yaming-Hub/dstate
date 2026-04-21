@@ -54,7 +54,7 @@ fn sync_message_full_snapshot_fields() {
 
     let msg = SyncMessage::FullSnapshot {
         state_name: "counters".into(),
-        source_node: NodeId(1),
+        source_node: NodeId("1".to_string()),
         generation: Generation::new(1, 5),
         wire_version: 1,
         data: vec![1, 2, 3],
@@ -69,7 +69,7 @@ fn sync_message_full_snapshot_fields() {
             data,
         } => {
             assert_eq!(state_name, "counters");
-            assert_eq!(source_node, NodeId(1));
+            assert_eq!(source_node, NodeId("1".to_string()));
             assert_eq!(generation, Generation::new(1, 5));
             assert_eq!(wire_version, 1);
             assert_eq!(data, vec![1, 2, 3]);
@@ -84,7 +84,7 @@ fn sync_message_delta_update_fields() {
 
     let msg = SyncMessage::DeltaUpdate {
         state_name: "sessions".into(),
-        source_node: NodeId(2),
+        source_node: NodeId("2".to_string()),
         generation: Generation::new(1, 10),
         wire_version: 1,
         data: vec![4, 5, 6],
@@ -98,7 +98,7 @@ fn sync_message_delta_update_fields() {
             ..
         } => {
             assert_eq!(state_name, "sessions");
-            assert_eq!(source_node, NodeId(2));
+            assert_eq!(source_node, NodeId("2".to_string()));
             assert_eq!(generation, Generation::new(1, 10));
         }
         _ => panic!("expected DeltaUpdate"),
@@ -111,7 +111,7 @@ fn sync_message_request_snapshot_fields() {
 
     let msg = SyncMessage::RequestSnapshot {
         state_name: "counters".into(),
-        requester: NodeId(3),
+        requester: NodeId("3".to_string()),
     };
 
     match msg {
@@ -120,7 +120,7 @@ fn sync_message_request_snapshot_fields() {
             requester,
         } => {
             assert_eq!(state_name, "counters");
-            assert_eq!(requester, NodeId(3));
+            assert_eq!(requester, NodeId("3".to_string()));
         }
         _ => panic!("expected RequestSnapshot"),
     }
@@ -131,22 +131,22 @@ fn sync_message_request_snapshot_fields() {
 #[test]
 fn batched_change_feed_construction() {
     let batch = BatchedChangeFeed {
-        source_node: NodeId(1),
+        source_node: NodeId("1".to_string()),
         notifications: vec![
             ChangeNotification {
                 state_name: "counters".into(),
-                source_node: NodeId(2),
+                source_node: NodeId("2".to_string()),
                 generation: Generation::new(1, 10),
             },
             ChangeNotification {
                 state_name: "sessions".into(),
-                source_node: NodeId(3),
+                source_node: NodeId("3".to_string()),
                 generation: Generation::new(2, 5),
             },
         ],
     };
 
-    assert_eq!(batch.source_node, NodeId(1));
+    assert_eq!(batch.source_node, NodeId("1".to_string()));
     assert_eq!(batch.notifications.len(), 2);
     assert_eq!(batch.notifications[0].state_name, "counters");
     assert_eq!(batch.notifications[1].state_name, "sessions");
@@ -169,19 +169,19 @@ fn change_notification_generation_ordering() {
 fn wire_to_change_feed_scenario() {
     // Simulate the flow: a node receives a BatchedChangeFeed from a peer
     // and needs to determine which shards are stale.
-    let self_node = NodeId(1);
+    let self_node = NodeId("1".to_string());
 
     let batch = BatchedChangeFeed {
-        source_node: NodeId(5), // relay node
+        source_node: NodeId("5".to_string()), // relay node
         notifications: vec![
             ChangeNotification {
                 state_name: "counters".into(),
-                source_node: NodeId(2),
+                source_node: NodeId("2".to_string()),
                 generation: Generation::new(1, 20),
             },
             ChangeNotification {
                 state_name: "sessions".into(),
-                source_node: NodeId(3),
+                source_node: NodeId("3".to_string()),
                 generation: Generation::new(1, 15),
             },
         ],

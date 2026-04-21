@@ -83,9 +83,9 @@ impl MockTransport {
     /// Broadcast a message from one node to all other nodes.
     pub fn broadcast(&mut self, from: NodeId, msg: &WireMessage, all_nodes: &[NodeId]) {
         let bytes = bincode::serialize(msg).expect("WireMessage serialization should not fail");
-        for &to in all_nodes {
-            if to != from {
-                self.send_bytes(from, to, bytes.clone());
+        for to in all_nodes {
+            if *to != from {
+                self.send_bytes(from.clone(), to.clone(), bytes.clone());
             }
         }
     }
@@ -171,14 +171,14 @@ impl MockTransport {
         };
 
         // Run through interceptor pipeline
-        let actions = self.apply_interceptors(from, to, &bytes, &context);
+        let actions = self.apply_interceptors(from.clone(), to.clone(), &bytes, &context);
 
         for action in actions {
             match action {
                 InterceptAction::Deliver(data) => {
                     self.in_flight.push_back(InFlightMessage {
-                        from,
-                        to,
+                        from: from.clone(),
+                        to: to.clone(),
                         data,
                         deliver_at_tick: self.current_tick + 1, // deliver next tick
                     });
@@ -189,8 +189,8 @@ impl MockTransport {
                 InterceptAction::Delay { bytes: data, ticks } => {
                     // Delay is additive to the baseline 1-tick latency
                     self.in_flight.push_back(InFlightMessage {
-                        from,
-                        to,
+                        from: from.clone(),
+                        to: to.clone(),
                         data,
                         deliver_at_tick: self.current_tick + 1 + ticks as u64,
                     });
@@ -198,8 +198,8 @@ impl MockTransport {
                 InterceptAction::DeliverMany(copies) => {
                     for data in copies {
                         self.in_flight.push_back(InFlightMessage {
-                            from,
-                            to,
+                            from: from.clone(),
+                            to: to.clone(),
                             data,
                             deliver_at_tick: self.current_tick + 1,
                         });
@@ -233,7 +233,7 @@ impl MockTransport {
         for interceptor in &mut self.interceptors {
             let mut next_pending = Vec::new();
             for msg_bytes in &pending {
-                match interceptor.intercept(from, to, msg_bytes, context) {
+                match interceptor.intercept(from.clone(), to.clone(), msg_bytes, context) {
                     InterceptAction::Deliver(data) => {
                         next_pending.push(data);
                     }
@@ -267,14 +267,14 @@ mod tests {
     fn test_msg() -> WireMessage {
         WireMessage::Sync(SyncMessage::RequestSnapshot {
             state_name: "test".into(),
-            requester: NodeId(1),
+            requester: NodeId("1".to_string()),
         })
     }
 
     #[test]
     fn send_and_deliver() {
         let mut transport = MockTransport::new(42);
-        transport.send(NodeId(1), NodeId(2), &test_msg());
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &test_msg());
 
         // Not delivered yet (deliver at tick 1, currently tick 0)
         let result = transport.deliver_due();
@@ -284,15 +284,15 @@ mod tests {
         transport.advance_tick();
         let result = transport.deliver_due();
         assert_eq!(result.delivered.len(), 1);
-        assert_eq!(result.delivered[0].from, NodeId(1));
-        assert_eq!(result.delivered[0].to, NodeId(2));
+        assert_eq!(result.delivered[0].from, NodeId("1".to_string()));
+        assert_eq!(result.delivered[0].to, NodeId("2".to_string()));
     }
 
     #[test]
     fn broadcast_sends_to_all_except_self() {
         let mut transport = MockTransport::new(42);
-        let all = vec![NodeId(1), NodeId(2), NodeId(3)];
-        transport.broadcast(NodeId(1), &test_msg(), &all);
+        let all = vec![NodeId("1".to_string()), NodeId("2".to_string()), NodeId("3".to_string())];
+        transport.broadcast(NodeId("1".to_string()), &test_msg(), &all);
 
         assert_eq!(transport.in_flight_count(), 2); // to 2 and 3
 
@@ -305,7 +305,7 @@ mod tests {
     fn drop_all_interceptor() {
         let mut transport = MockTransport::new(42);
         transport.add_interceptor(Box::new(DropAll));
-        transport.send(NodeId(1), NodeId(2), &test_msg());
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &test_msg());
 
         assert_eq!(transport.in_flight_count(), 0);
         transport.advance_tick();
@@ -317,7 +317,7 @@ mod tests {
     fn delay_interceptor() {
         let mut transport = MockTransport::new(42);
         transport.add_interceptor(Box::new(DelayTicks(3)));
-        transport.send(NodeId(1), NodeId(2), &test_msg());
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &test_msg());
 
         // Baseline 1 tick + 3 extra = deliver at tick 4
         // Not delivered for ticks 1..3
@@ -336,7 +336,7 @@ mod tests {
     fn duplicate_interceptor() {
         let mut transport = MockTransport::new(42);
         transport.add_interceptor(Box::new(DuplicateAll));
-        transport.send(NodeId(1), NodeId(2), &test_msg());
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &test_msg());
 
         assert_eq!(transport.in_flight_count(), 2);
         transport.advance_tick();
@@ -348,11 +348,11 @@ mod tests {
     fn clear_interceptors_restores_clean_network() {
         let mut transport = MockTransport::new(42);
         transport.add_interceptor(Box::new(DropAll));
-        transport.send(NodeId(1), NodeId(2), &test_msg());
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &test_msg());
         assert_eq!(transport.in_flight_count(), 0);
 
         transport.clear_interceptors();
-        transport.send(NodeId(1), NodeId(2), &test_msg());
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &test_msg());
         assert_eq!(transport.in_flight_count(), 1);
     }
 
@@ -366,12 +366,12 @@ mod tests {
         // Send a real message
         let msg = WireMessage::Sync(SyncMessage::FullSnapshot {
             state_name: "test".into(),
-            source_node: NodeId(1),
+            source_node: NodeId("1".to_string()),
             generation: Generation::new(1, 1),
             wire_version: 1,
             data: vec![1, 2, 3],
         });
-        transport.send(NodeId(1), NodeId(2), &msg);
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &msg);
 
         transport.advance_tick();
         let result = transport.deliver_due();
@@ -385,7 +385,7 @@ mod tests {
         let mut transport = MockTransport::new(42);
         transport.add_interceptor(Box::new(DuplicateAll));
         transport.add_interceptor(Box::new(DelayTicks(2)));
-        transport.send(NodeId(1), NodeId(2), &test_msg());
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &test_msg());
 
         // Both copies should be delayed: baseline 1 + 2 extra = tick 3
         for _ in 0..2 {
@@ -401,7 +401,7 @@ mod tests {
     fn delay_zero_delivers_next_tick() {
         let mut transport = MockTransport::new(42);
         transport.add_interceptor(Box::new(DelayTicks(0)));
-        transport.send(NodeId(1), NodeId(2), &test_msg());
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &test_msg());
 
         // DelayTicks(0) = baseline only = deliver at tick 1
         let result = transport.deliver_due();
@@ -414,16 +414,16 @@ mod tests {
     #[test]
     fn drop_in_flight_for_node() {
         let mut transport = MockTransport::new(42);
-        transport.send(NodeId(1), NodeId(2), &test_msg());
-        transport.send(NodeId(3), NodeId(2), &test_msg());
+        transport.send(NodeId("1".to_string()), NodeId("2".to_string()), &test_msg());
+        transport.send(NodeId("3".to_string()), NodeId("2".to_string()), &test_msg());
         assert_eq!(transport.in_flight_count(), 2);
 
-        transport.drop_in_flight_for(NodeId(1));
+        transport.drop_in_flight_for(NodeId("1".to_string()));
         assert_eq!(transport.in_flight_count(), 1);
 
         transport.advance_tick();
         let result = transport.deliver_due();
         assert_eq!(result.delivered.len(), 1);
-        assert_eq!(result.delivered[0].from, NodeId(3));
+        assert_eq!(result.delivered[0].from, NodeId("3".to_string()));
     }
 }

@@ -1,16 +1,22 @@
 # Distributed State — Development Plan
 
-This plan breaks the distributed state **multi-crate workspace**
-implementation into reviewable PRs following **test-driven development
-(TDD)**. Each PR completes a logical component end-to-end — types,
-implementation, and tests — so it can be reviewed and validated
-independently.
+> **Note (v1.0):** This plan was written for the v0.1 multi-crate architecture
+> with `dstate-ractor` and `dstate-kameo` adapter crates. In v1.0, the adapter
+> crates were removed and replaced by a dependency on the
+> [`dactor`](https://crates.io/crates/dactor) crate. The `ActorRuntime` and
+> `ActorRef<M>` traits have been removed from dstate. PRs 8 and 9 (adapter
+> crates) are superseded. The core crate PRs (1–7) and integration test PRs
+> (10–11) remain valid.
 
-The workspace contains three crates (see Design §6.0.3):
+This plan breaks the distributed state workspace implementation into
+reviewable PRs following **test-driven development (TDD)**. Each PR completes
+a logical component end-to-end — types, implementation, and tests — so it can
+be reviewed and validated independently.
+
+The workspace contains two crates:
 - **`dstate`** — core crate with traits, types, pure logic, and test support
-  (no actor framework dependency)
-- **`dstate-ractor`** — ractor adapter crate
-- **`dstate-kameo`** — kameo adapter crate
+  (actor framework integration via `dactor` dependency)
+- **`dstate-integration`** — integration test framework with mock cluster
 
 References:
 - [Design Spec](./distributed-state-design.md)

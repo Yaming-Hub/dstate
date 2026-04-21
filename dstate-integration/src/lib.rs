@@ -7,13 +7,14 @@
 //!
 //! # Architecture
 //!
-//! Instead of implementing `ActorRuntime`, this framework drives
+//! This framework drives
 //! [`DistributedStateEngine`](dstate::engine::DistributedStateEngine)
-//! instances directly. The engine's action-based API (`Vec<EngineAction>`)
-//! makes this possible — the [`MockCluster`](cluster::MockCluster)
-//! executes all outbound effects through a [`MockTransport`](transport::MockTransport)
-//! that serializes messages to bytes, routes them through an interceptor
-//! pipeline, and delivers them to target engines.
+//! instances directly — no actor runtime needed. The engine's action-based
+//! API (`Vec<EngineAction>`) makes this possible — the
+//! [`MockCluster`](cluster::MockCluster) executes all outbound effects
+//! through a [`MockTransport`](transport::MockTransport) that serializes
+//! messages to bytes, routes them through an interceptor pipeline, and
+//! delivers them to target engines.
 //!
 //! # Modules
 //!

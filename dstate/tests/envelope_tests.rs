@@ -41,7 +41,7 @@ fn env_03_state_view_object_tracks_synced_at() {
         modified_time: 2000,
         synced_at: now,
         pending_remote_generation: None,
-        source_node: NodeId(1),
+        source_node: NodeId("1".to_string()),
     };
     // synced_at should be close to now
     assert!(view.synced_at.elapsed().as_millis() < 100);
@@ -69,7 +69,7 @@ fn env_05_wire_version_set() {
         modified_time: 1000,
         synced_at: Instant::now(),
         pending_remote_generation: None,
-        source_node: NodeId(1),
+        source_node: NodeId("1".to_string()),
     };
     assert_eq!(view.wire_version, 3);
 }
@@ -103,7 +103,7 @@ fn env_07_incarnation_propagated_to_view() {
         modified_time: obj.modified_time,
         synced_at: Instant::now(),
         pending_remote_generation: None,
-        source_node: NodeId(0),
+        source_node: NodeId("0".to_string()),
     };
     assert_eq!(view.generation.incarnation, obj.incarnation());
 }
@@ -118,7 +118,7 @@ fn env_08_pending_remote_generation_tracks_restarts() {
         modified_time: 2000,
         synced_at: Instant::now(),
         pending_remote_generation: None,
-        source_node: NodeId(1),
+        source_node: NodeId("1".to_string()),
     };
 
     // Simulate receiving a change notification after owner restart

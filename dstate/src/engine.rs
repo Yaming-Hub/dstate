@@ -215,7 +215,7 @@ where
         let state = shard_core::new_state_object(initial_value, clock.unix_ms() as u64, &*clock);
         let initial_view = project_initial(&state.value);
 
-        let shard = ShardCore::new(node_id, state, initial_view, clock.clone());
+        let shard = ShardCore::new(node_id.clone(), state, initial_view, clock.clone());
 
         let sync_logic = SyncLogic::new(
             state_name.clone(),
@@ -432,7 +432,7 @@ where
     /// Removes the node's view and adds it to the departed set (filtering
     /// late in-flight messages).
     pub fn on_node_left(&mut self, node_id: NodeId) {
-        self.lifecycle.on_node_left(&self.shard, node_id);
+        self.lifecycle.on_node_left(&self.shard, node_id.clone());
         self.diagnostics.remove_peer(&node_id);
     }
 
@@ -463,14 +463,15 @@ where
                 result,
             } => {
                 let actions = if self.sync_logic.strategy().pull_on_query {
+                    let requester = self.shard.node_id();
                     stale_peers
                         .iter()
                         .filter(|peer| self.lifecycle.should_accept_from(peer))
-                        .map(|&peer| EngineAction::SendSync {
-                            target: peer,
+                        .map(|peer| EngineAction::SendSync {
+                            target: peer.clone(),
                             message: SyncMessage::RequestSnapshot {
                                 state_name: self.state_name.clone(),
-                                requester: self.shard.node_id(),
+                                requester: requester.clone(),
                             },
                         })
                         .collect()
@@ -585,7 +586,7 @@ where
 
     fn own_view_value(&self) -> V {
         self.shard
-            .get_view(&self.shard.node_id())
+            .get_view(self.shard.node_id_ref())
             .expect("own view should always exist")
             .value
             .clone()
@@ -734,7 +735,7 @@ where
                 match &action {
                     VersionMismatchAction::DropView { reason, .. } => {
                         self.diagnostics.record_sync_failure(
-                            source_node,
+                            &source_node,
                             reason,
                             self.shard.clock(),
                         );
@@ -743,7 +744,7 @@ where
                     }
                     VersionMismatchAction::KeepStale { reason, .. } => {
                         self.diagnostics.record_sync_failure(
-                            source_node,
+                            &source_node,
                             reason,
                             self.shard.clock(),
                         );
@@ -754,7 +755,7 @@ where
             }
             InboundVersionResult::MalformedData(msg) => {
                 self.diagnostics.record_sync_failure(
-                    source_node,
+                    &source_node,
                     &format!("malformed: {msg}"),
                     self.shard.clock(),
                 );
@@ -764,7 +765,7 @@ where
 
         let now_ms = self.shard.clock().unix_ms();
         let snap = InboundSnapshot {
-            source: source_node,
+            source: source_node.clone(),
             generation,
             wire_version,
             view,
@@ -775,12 +776,9 @@ where
         match self.shard.accept_inbound_snapshot(snap) {
             AcceptResult::Accepted => {
                 self.diagnostics
-                    .record_snapshot_received(source_node, 0, self.shard.clock());
+                    .record_snapshot_received(&source_node, 0, self.shard.clock());
             }
             AcceptResult::Discarded => {
-                // Stale snapshot (our view is already newer).
-                // Note: record_stale_delta_discarded covers both stale snapshots
-                // and deltas; rename in a future metrics refactor if needed.
                 self.diagnostics.record_stale_delta_discarded();
             }
         }
@@ -808,13 +806,13 @@ where
             let action = self.versioning.on_deserialize_error(wire_version);
             let reason = match &action {
                 VersionMismatchAction::DropView { reason, .. } => {
-                    self.shard.on_node_left(source_node);
+                    self.shard.on_node_left(source_node.clone());
                     reason.clone()
                 }
                 VersionMismatchAction::KeepStale { reason, .. } => reason.clone(),
             };
             self.diagnostics
-                .record_sync_failure(source_node, &reason, self.shard.clock());
+                .record_sync_failure(&source_node, &reason, self.shard.clock());
             return vec![];
         }
 
@@ -840,7 +838,7 @@ where
                 return vec![];
             }
             // Gap detected: need a full snapshot to catch up.
-            self.diagnostics.record_gap_detected(source_node);
+            self.diagnostics.record_gap_detected(&source_node);
             return vec![self.make_snapshot_request(source_node)];
         }
 
@@ -857,25 +855,25 @@ where
                     }
                 };
                 self.diagnostics
-                    .record_sync_failure(source_node, &reason, self.shard.clock());
+                    .record_sync_failure(&source_node, &reason, self.shard.clock());
                 return vec![self.make_snapshot_request(source_node)];
             }
         };
 
         let result = self
             .shard
-            .accept_inbound_delta(source_node, generation, wire_version, |_existing| {
+            .accept_inbound_delta(source_node.clone(), generation, wire_version, |_existing| {
                 new_view
             });
 
         match result {
             DeltaAcceptResult::Applied => {
                 self.diagnostics
-                    .record_delta_received(source_node, 0, self.shard.clock());
+                    .record_delta_received(&source_node, 0, self.shard.clock());
                 vec![]
             }
             DeltaAcceptResult::GapDetected { .. } => {
-                self.diagnostics.record_gap_detected(source_node);
+                self.diagnostics.record_gap_detected(&source_node);
                 vec![self.make_snapshot_request(source_node)]
             }
             DeltaAcceptResult::Discarded => {
@@ -1011,9 +1009,9 @@ mod tests {
     #[test]
     fn engine_initial_state() {
         let clock = test_clock();
-        let engine = make_engine(NodeId(1), clock);
+        let engine = make_engine(NodeId("1".to_string()), clock);
 
-        assert_eq!(engine.node_id(), NodeId(1));
+        assert_eq!(engine.node_id(), NodeId("1".to_string()));
         assert_eq!(engine.state_name(), "test_state");
         assert_eq!(engine.view_count(), 1); // own view
         assert_eq!(engine.state().value.counter, 0);
@@ -1024,7 +1022,7 @@ mod tests {
     #[test]
     fn mutate_active_push_broadcasts_snapshot() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
 
         let result = engine.mutate(
             |s| {
@@ -1053,7 +1051,7 @@ mod tests {
     #[test]
     fn mutate_suppress_no_actions() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
 
         let result = engine.mutate(|s| s.counter += 1, |s| s.clone(), SyncUrgency::Suppress);
 
@@ -1064,7 +1062,7 @@ mod tests {
     #[test]
     fn mutate_delayed_produces_scheduled_action() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
         let delay = Duration::from_secs(5);
 
         let result = engine.mutate(
@@ -1083,7 +1081,7 @@ mod tests {
     #[test]
     fn mutate_feed_mode_notifies_change_feed() {
         let clock = test_clock();
-        let mut engine = make_feed_engine(NodeId(1), clock);
+        let mut engine = make_feed_engine(NodeId("1".to_string()), clock);
 
         let result = engine.mutate(|s| s.counter += 1, |s| s.clone(), SyncUrgency::Default);
 
@@ -1093,7 +1091,7 @@ mod tests {
 
         // Flush produces a BatchedChangeFeed
         let feed = engine.flush_change_feed().unwrap();
-        assert_eq!(feed.source_node, NodeId(1));
+        assert_eq!(feed.source_node, NodeId("1".to_string()));
         assert_eq!(feed.notifications.len(), 1);
         assert_eq!(feed.notifications[0].state_name, "test_state");
     }
@@ -1101,7 +1099,7 @@ mod tests {
     #[test]
     fn mutate_immediate_overrides_feed_mode() {
         let clock = test_clock();
-        let mut engine = make_feed_engine(NodeId(1), clock);
+        let mut engine = make_feed_engine(NodeId("1".to_string()), clock);
 
         let result = engine.mutate(|s| s.counter += 1, |s| s.clone(), SyncUrgency::Immediate);
 
@@ -1118,7 +1116,7 @@ mod tests {
     #[test]
     fn delta_mutate_broadcasts_delta() {
         let clock = test_clock();
-        let mut engine = make_delta_engine(NodeId(1), clock);
+        let mut engine = make_delta_engine(NodeId("1".to_string()), clock);
 
         let result = engine.mutate_with_delta(
             |s| {
@@ -1153,10 +1151,10 @@ mod tests {
     #[test]
     fn inbound_snapshot_accepted() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
 
         // Add node 2 as a peer
-        engine.on_node_joined(NodeId(2), TestState::default());
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
 
         // Simulate inbound snapshot from node 2
         let peer_state = TestState {
@@ -1167,7 +1165,7 @@ mod tests {
 
         let actions = engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 3),
             wire_version: 1,
             data,
@@ -1176,7 +1174,7 @@ mod tests {
         assert!(actions.is_empty());
 
         // Verify the view was updated
-        let view = engine.get_view(&NodeId(2)).unwrap();
+        let view = engine.get_view(&NodeId("2".to_string())).unwrap();
         assert_eq!(view.value.counter, 42);
         assert_eq!(view.generation.age, 3);
 
@@ -1186,12 +1184,12 @@ mod tests {
     #[test]
     fn inbound_snapshot_wrong_state_name_ignored() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
-        engine.on_node_joined(NodeId(2), TestState::default());
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
 
         let actions = engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "other_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1, 1),
             wire_version: 1,
             data: vec![],
@@ -1204,11 +1202,11 @@ mod tests {
     #[test]
     fn inbound_snapshot_departed_node_rejected() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
 
         // Add and then remove node 2
-        engine.on_node_joined(NodeId(2), TestState::default());
-        engine.on_node_left(NodeId(2));
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
+        engine.on_node_left(NodeId("2".to_string()));
 
         let peer_state = TestState {
             counter: 99,
@@ -1218,25 +1216,25 @@ mod tests {
 
         let actions = engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1, 1),
             wire_version: 1,
             data,
         });
 
         assert!(actions.is_empty());
-        assert!(engine.get_view(&NodeId(2)).is_none());
+        assert!(engine.get_view(&NodeId("2".to_string())).is_none());
     }
 
     #[test]
     fn inbound_snapshot_version_mismatch() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
-        engine.on_node_joined(NodeId(2), TestState::default());
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
 
         let actions = engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1, 1),
             wire_version: 99, // unsupported
             data: vec![1, 2, 3],
@@ -1249,12 +1247,12 @@ mod tests {
     #[test]
     fn inbound_snapshot_malformed_data() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
-        engine.on_node_joined(NodeId(2), TestState::default());
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
 
         let actions = engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1, 1),
             wire_version: 1,
             data: vec![0xFF, 0xFF], // garbage
@@ -1269,10 +1267,10 @@ mod tests {
     #[test]
     fn inbound_delta_applied() {
         let clock = test_clock();
-        let mut engine = make_delta_engine(NodeId(1), clock);
+        let mut engine = make_delta_engine(NodeId("1".to_string()), clock);
 
         // Add peer and accept initial snapshot
-        engine.on_node_joined(NodeId(2), TestDeltaView { counter: 0, label: String::new() });
+        engine.on_node_joined(NodeId("2".to_string()), TestDeltaView { counter: 0, label: String::new() });
         let initial_view = TestDeltaView {
             counter: 10,
             label: "peer".into(),
@@ -1280,7 +1278,7 @@ mod tests {
         let data = TestDeltaState::serialize_view(&initial_view);
         engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_delta_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 1),
             wire_version: 1,
             data,
@@ -1294,14 +1292,14 @@ mod tests {
         let delta_data = TestDeltaState::serialize_delta(&delta);
         let actions = engine.handle_inbound_sync(SyncMessage::DeltaUpdate {
             state_name: "test_delta_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 2),
             wire_version: 1,
             data: delta_data,
         });
 
         assert!(actions.is_empty());
-        let view = engine.get_view(&NodeId(2)).unwrap();
+        let view = engine.get_view(&NodeId("2".to_string())).unwrap();
         assert_eq!(view.value.counter, 15); // 10 + 5
         assert_eq!(engine.metrics().deltas_received, 1);
     }
@@ -1309,38 +1307,37 @@ mod tests {
     #[test]
     fn inbound_delta_without_applier_requests_snapshot() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock); // no delta applier
-        engine.on_node_joined(NodeId(2), TestState::default());
+        let mut engine = make_engine(NodeId("1".to_string()), clock); // no delta applier
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
 
         let actions = engine.handle_inbound_sync(SyncMessage::DeltaUpdate {
             state_name: "test_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1, 1),
             wire_version: 1,
             data: vec![1, 2, 3],
         });
 
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            EngineAction::SendSync {
-                target: NodeId(2),
-                message: SyncMessage::RequestSnapshot { .. }
+        match &actions[0] {
+            EngineAction::SendSync { target, message: SyncMessage::RequestSnapshot { .. } } => {
+                assert_eq!(*target, NodeId("2".to_string()));
             }
-        ));
+            other => panic!("expected SendSync/RequestSnapshot, got {:?}", other),
+        };
     }
 
     #[test]
     fn inbound_delta_gap_requests_snapshot() {
         let clock = test_clock();
-        let mut engine = make_delta_engine(NodeId(1), clock);
-        engine.on_node_joined(NodeId(2), TestDeltaView { counter: 0, label: String::new() });
+        let mut engine = make_delta_engine(NodeId("1".to_string()), clock);
+        engine.on_node_joined(NodeId("2".to_string()), TestDeltaView { counter: 0, label: String::new() });
 
         // Accept snapshot at age=1
         let initial_view = TestDeltaView { counter: 10, label: "peer".into() };
         engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_delta_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 1),
             wire_version: 1,
             data: TestDeltaState::serialize_view(&initial_view),
@@ -1350,7 +1347,7 @@ mod tests {
         let delta = TestDeltaViewDelta { counter_delta: 1, new_label: None };
         let actions = engine.handle_inbound_sync(SyncMessage::DeltaUpdate {
             state_name: "test_delta_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 5), // gap
             wire_version: 1,
             data: TestDeltaState::serialize_delta(&delta),
@@ -1372,12 +1369,12 @@ mod tests {
     #[test]
     fn request_snapshot_sends_own_view() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
         engine.mutate(|s| s.counter = 42, |s| s.clone(), SyncUrgency::Default);
 
         let actions = engine.handle_inbound_sync(SyncMessage::RequestSnapshot {
             state_name: "test_state".into(),
-            requester: NodeId(2),
+            requester: NodeId("2".to_string()),
         });
 
         assert_eq!(actions.len(), 1);
@@ -1386,7 +1383,7 @@ mod tests {
             message: SyncMessage::FullSnapshot { data, .. },
         } = &actions[0]
         {
-            assert_eq!(*target, NodeId(2));
+            assert_eq!(*target, NodeId("2".to_string()));
             let view: TestState = bincode::deserialize(data).unwrap();
             assert_eq!(view.counter, 42);
         } else {
@@ -1399,14 +1396,14 @@ mod tests {
     #[test]
     fn change_feed_marks_stale() {
         let clock = test_clock();
-        let mut engine = make_feed_engine(NodeId(1), clock.clone());
-        engine.on_node_joined(NodeId(2), TestState::default());
+        let mut engine = make_feed_engine(NodeId("1".to_string()), clock.clone());
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
 
         // Accept initial snapshot from node 2 so it has a real generation
         let data = bincode::serialize(&TestState { counter: 1, label: "x".into() }).unwrap();
         engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 1),
             wire_version: 1,
             data,
@@ -1414,10 +1411,10 @@ mod tests {
 
         // Receive a change feed indicating node 2 has a newer generation
         let feed = BatchedChangeFeed {
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             notifications: vec![crate::types::sync_message::ChangeNotification {
                 state_name: "test_state".into(),
-                source_node: NodeId(2),
+                source_node: NodeId("2".to_string()),
                 generation: Generation::new(1_000_000, 5),
             }],
         };
@@ -1426,7 +1423,7 @@ mod tests {
         // Now query should detect staleness
         clock.advance(Duration::from_secs(10));
         let (result, actions) = engine.query(Duration::from_millis(1), |views| {
-            views.get(&NodeId(2)).map(|v| v.value.counter)
+            views.get(&NodeId("2".to_string())).map(|v| v.value.counter)
         });
 
         assert!(matches!(result, EngineQueryResult::Stale { .. }));
@@ -1439,34 +1436,33 @@ mod tests {
     #[test]
     fn node_joined_sends_snapshot() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
         engine.mutate(|s| s.counter = 10, |s| s.clone(), SyncUrgency::Default);
 
-        let actions = engine.on_node_joined(NodeId(2), TestState::default());
+        let actions = engine.on_node_joined(NodeId("2".to_string()), TestState::default());
 
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            EngineAction::SendSync {
-                target: NodeId(2),
-                message: SyncMessage::FullSnapshot { .. }
+        match &actions[0] {
+            EngineAction::SendSync { target, message: SyncMessage::FullSnapshot { .. } } => {
+                assert_eq!(*target, NodeId("2".to_string()));
             }
-        ));
+            other => panic!("expected SendSync/FullSnapshot, got {:?}", other),
+        };
         assert_eq!(engine.view_count(), 2);
     }
 
     #[test]
     fn node_left_removes_view() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
-        engine.on_node_joined(NodeId(2), TestState::default());
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
         assert_eq!(engine.view_count(), 2);
 
-        engine.on_node_left(NodeId(2));
+        engine.on_node_left(NodeId("2".to_string()));
 
         assert_eq!(engine.view_count(), 1);
-        assert!(engine.get_view(&NodeId(2)).is_none());
-        assert!(!engine.should_accept_from(&NodeId(2)));
+        assert!(engine.get_view(&NodeId("2".to_string())).is_none());
+        assert!(!engine.should_accept_from(&NodeId("2".to_string())));
     }
 
     // ── Query tests ─────────────────────────────────────────────
@@ -1474,11 +1470,11 @@ mod tests {
     #[test]
     fn query_fresh_returns_all_views() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
         engine.mutate(|s| s.counter = 100, |s| s.clone(), SyncUrgency::Default);
 
         let (result, actions) = engine.query(Duration::from_secs(60), |views| {
-            views.get(&NodeId(1)).unwrap().value.counter
+            views.get(&NodeId("1".to_string())).unwrap().value.counter
         });
 
         assert!(matches!(result, EngineQueryResult::Fresh(100)));
@@ -1492,7 +1488,7 @@ mod tests {
         let clock = test_clock();
         let mut engine = DistributedStateEngine::new(
             "test_state",
-            NodeId(1),
+            NodeId("1".to_string()),
             TestState::default(),
             |s| s.clone(),
             StateConfig {
@@ -1522,7 +1518,7 @@ mod tests {
     #[test]
     fn periodic_sync_returns_empty_when_not_configured() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock); // ActivePush, no periodic
+        let mut engine = make_engine(NodeId("1".to_string()), clock); // ActivePush, no periodic
         let actions = engine.periodic_sync();
         assert!(actions.is_empty());
     }
@@ -1532,7 +1528,7 @@ mod tests {
     #[test]
     fn health_status_with_no_peers() {
         let clock = test_clock();
-        let engine = make_engine(NodeId(1), clock);
+        let engine = make_engine(NodeId("1".to_string()), clock);
         let h = engine.health(Duration::from_secs(60));
         assert_eq!(h.status, HealthStatus::Healthy);
         assert_eq!(h.stale_peers, 0);
@@ -1541,7 +1537,7 @@ mod tests {
     #[test]
     fn metrics_track_mutations() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
 
         for _ in 0..5 {
             engine.mutate(|s| s.counter += 1, |s| s.clone(), SyncUrgency::Default);
@@ -1557,12 +1553,12 @@ mod tests {
     #[test]
     fn full_round_trip_two_engines() {
         let clock = test_clock();
-        let mut engine1 = make_engine(NodeId(1), clock.clone());
-        let mut engine2 = make_engine(NodeId(2), clock);
+        let mut engine1 = make_engine(NodeId("1".to_string()), clock.clone());
+        let mut engine2 = make_engine(NodeId("2".to_string()), clock);
 
         // Join each other
-        engine1.on_node_joined(NodeId(2), TestState::default());
-        engine2.on_node_joined(NodeId(1), TestState::default());
+        engine1.on_node_joined(NodeId("2".to_string()), TestState::default());
+        engine2.on_node_joined(NodeId("1".to_string()), TestState::default());
 
         // Engine 1 mutates
         let result = engine1.mutate(
@@ -1582,7 +1578,7 @@ mod tests {
         }
 
         // Verify engine 2 has the updated view
-        let view = engine2.get_view(&NodeId(1)).unwrap();
+        let view = engine2.get_view(&NodeId("1".to_string())).unwrap();
         assert_eq!(view.value.counter, 42);
         assert_eq!(view.value.label, "hello");
     }
@@ -1590,15 +1586,15 @@ mod tests {
     #[test]
     fn delta_round_trip_two_engines() {
         let clock = test_clock();
-        let mut engine1 = make_delta_engine(NodeId(1), clock.clone());
-        let mut engine2 = make_delta_engine(NodeId(2), clock);
+        let mut engine1 = make_delta_engine(NodeId("1".to_string()), clock.clone());
+        let mut engine2 = make_delta_engine(NodeId("2".to_string()), clock);
 
         let default_view = TestDeltaView {
             counter: 0,
             label: String::new(),
         };
-        engine1.on_node_joined(NodeId(2), default_view.clone());
-        engine2.on_node_joined(NodeId(1), default_view);
+        engine1.on_node_joined(NodeId("2".to_string()), default_view.clone());
+        engine2.on_node_joined(NodeId("1".to_string()), default_view);
 
         // Engine 1 mutates with delta
         let result = engine1.mutate_with_delta(
@@ -1621,7 +1617,7 @@ mod tests {
         let snapshot_data = TestDeltaState::serialize_view(&result.view);
         engine2.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_delta_state".into(),
-            source_node: NodeId(1),
+            source_node: NodeId("1".to_string()),
             generation: result.generation,
             wire_version: 1,
             data: snapshot_data,
@@ -1650,7 +1646,7 @@ mod tests {
         }
 
         // Verify engine 2 applied the delta
-        let view = engine2.get_view(&NodeId(1)).unwrap();
+        let view = engine2.get_view(&NodeId("1".to_string())).unwrap();
         assert_eq!(view.value.counter, 13); // 10 + 3
     }
 
@@ -1659,16 +1655,16 @@ mod tests {
     #[test]
     fn request_snapshot_rejected_from_departed_node() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
 
         // Add and remove node 2
-        engine.on_node_joined(NodeId(2), TestState::default());
-        engine.on_node_left(NodeId(2));
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
+        engine.on_node_left(NodeId("2".to_string()));
 
         // Departed node requests a snapshot — should be silently ignored
         let actions = engine.handle_inbound_sync(SyncMessage::RequestSnapshot {
             state_name: "test_state".into(),
-            requester: NodeId(2),
+            requester: NodeId("2".to_string()),
         });
         assert!(actions.is_empty());
         // Snapshot should NOT have been sent (metric stays at 1 from on_node_joined)
@@ -1678,26 +1674,26 @@ mod tests {
     #[test]
     fn change_feed_from_departed_node_ignored() {
         let clock = test_clock();
-        let mut engine = make_feed_engine(NodeId(1), clock.clone());
+        let mut engine = make_feed_engine(NodeId("1".to_string()), clock.clone());
 
         // Add peer, accept initial snapshot, then remove
-        engine.on_node_joined(NodeId(2), TestState::default());
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
         let data = bincode::serialize(&TestState { counter: 1, label: "x".into() }).unwrap();
         engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 1),
             wire_version: 1,
             data,
         });
-        engine.on_node_left(NodeId(2));
+        engine.on_node_left(NodeId("2".to_string()));
 
         // Receive change feed from departed node — should be ignored
         let feed = BatchedChangeFeed {
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             notifications: vec![crate::types::sync_message::ChangeNotification {
                 state_name: "test_state".into(),
-                source_node: NodeId(2),
+                source_node: NodeId("2".to_string()),
                 generation: Generation::new(1_000_000, 10),
             }],
         };
@@ -1709,7 +1705,7 @@ mod tests {
         // No RequestSnapshot to departed node
         let requests_to_node2: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, EngineAction::SendSync { target: NodeId(2), .. }))
+            .filter(|a| matches!(a, EngineAction::SendSync { target, .. } if *target == NodeId("2".to_string())))
             .collect();
         assert!(requests_to_node2.is_empty());
     }
@@ -1717,18 +1713,18 @@ mod tests {
     #[test]
     fn query_pull_skips_departed_peers() {
         let clock = test_clock();
-        let mut engine = make_feed_engine(NodeId(1), clock.clone());
+        let mut engine = make_feed_engine(NodeId("1".to_string()), clock.clone());
 
         // Add two peers
-        engine.on_node_joined(NodeId(2), TestState::default());
-        engine.on_node_joined(NodeId(3), TestState::default());
+        engine.on_node_joined(NodeId("2".to_string()), TestState::default());
+        engine.on_node_joined(NodeId("3".to_string()), TestState::default());
 
         // Accept snapshots from both
         for &id in &[2u64, 3] {
             let data = bincode::serialize(&TestState { counter: id, label: format!("n{id}") }).unwrap();
             engine.handle_inbound_sync(SyncMessage::FullSnapshot {
                 state_name: "test_state".into(),
-                source_node: NodeId(id),
+                source_node: NodeId(id.to_string()),
                 generation: Generation::new(1_000_000, 1),
                 wire_version: 1,
                 data,
@@ -1736,14 +1732,14 @@ mod tests {
         }
 
         // Depart node 2
-        engine.on_node_left(NodeId(2));
+        engine.on_node_left(NodeId("2".to_string()));
 
         // Make node 3 stale
         let feed = BatchedChangeFeed {
-            source_node: NodeId(3),
+            source_node: NodeId("3".to_string()),
             notifications: vec![crate::types::sync_message::ChangeNotification {
                 state_name: "test_state".into(),
-                source_node: NodeId(3),
+                source_node: NodeId("3".to_string()),
                 generation: Generation::new(1_000_000, 5),
             }],
         };
@@ -1756,25 +1752,25 @@ mod tests {
         let targets: Vec<NodeId> = actions
             .iter()
             .filter_map(|a| match a {
-                EngineAction::SendSync { target, .. } => Some(*target),
+                EngineAction::SendSync { target, .. } => Some(target.clone()),
                 _ => None,
             })
             .collect();
-        assert!(targets.contains(&NodeId(3)));
-        assert!(!targets.contains(&NodeId(2)));
+        assert!(targets.contains(&NodeId("3".to_string())));
+        assert!(!targets.contains(&NodeId("2".to_string())));
     }
 
     #[test]
     fn inbound_delta_stale_discarded() {
         let clock = test_clock();
-        let mut engine = make_delta_engine(NodeId(1), clock);
+        let mut engine = make_delta_engine(NodeId("1".to_string()), clock);
 
-        engine.on_node_joined(NodeId(2), TestDeltaView { counter: 0, label: String::new() });
+        engine.on_node_joined(NodeId("2".to_string()), TestDeltaView { counter: 0, label: String::new() });
         // Accept snapshot at age=5
         let view = TestDeltaView { counter: 50, label: "peer".into() };
         engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_delta_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 5),
             wire_version: 1,
             data: TestDeltaState::serialize_view(&view),
@@ -1784,7 +1780,7 @@ mod tests {
         let delta = TestDeltaViewDelta { counter_delta: 1, new_label: None };
         let actions = engine.handle_inbound_sync(SyncMessage::DeltaUpdate {
             state_name: "test_delta_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 3),
             wire_version: 1,
             data: TestDeltaState::serialize_delta(&delta),
@@ -1794,20 +1790,20 @@ mod tests {
         assert!(actions.is_empty());
         assert_eq!(engine.metrics().stale_deltas_discarded, 1);
         // View should be unchanged
-        let v = engine.get_view(&NodeId(2)).unwrap();
+        let v = engine.get_view(&NodeId("2".to_string())).unwrap();
         assert_eq!(v.value.counter, 50);
     }
 
     #[test]
     fn inbound_delta_wrong_wire_version_rejected() {
         let clock = test_clock();
-        let mut engine = make_delta_engine(NodeId(1), clock);
+        let mut engine = make_delta_engine(NodeId("1".to_string()), clock);
 
-        engine.on_node_joined(NodeId(2), TestDeltaView { counter: 0, label: String::new() });
+        engine.on_node_joined(NodeId("2".to_string()), TestDeltaView { counter: 0, label: String::new() });
         let view = TestDeltaView { counter: 10, label: "p".into() };
         engine.handle_inbound_sync(SyncMessage::FullSnapshot {
             state_name: "test_delta_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 1),
             wire_version: 1,
             data: TestDeltaState::serialize_view(&view),
@@ -1816,7 +1812,7 @@ mod tests {
         // Send delta with wrong wire version
         let actions = engine.handle_inbound_sync(SyncMessage::DeltaUpdate {
             state_name: "test_delta_state".into(),
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             generation: Generation::new(1_000_000, 2),
             wire_version: 99,
             data: vec![1, 2, 3],
@@ -1829,18 +1825,18 @@ mod tests {
     #[test]
     fn handle_inbound_wire_message_dispatches() {
         let clock = test_clock();
-        let mut engine = make_engine(NodeId(1), clock);
+        let mut engine = make_engine(NodeId("1".to_string()), clock);
 
         // Test WireMessage::Sync dispatch
         let actions = engine.handle_inbound(WireMessage::Sync(SyncMessage::RequestSnapshot {
             state_name: "test_state".into(),
-            requester: NodeId(2),
+            requester: NodeId("2".to_string()),
         }));
         assert_eq!(actions.len(), 1);
 
         // Test WireMessage::Feed dispatch
         let actions = engine.handle_inbound(WireMessage::Feed(BatchedChangeFeed {
-            source_node: NodeId(2),
+            source_node: NodeId("2".to_string()),
             notifications: vec![],
         }));
         assert!(actions.is_empty());

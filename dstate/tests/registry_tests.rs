@@ -192,7 +192,7 @@ fn reg_05_broadcast_node_joined() {
         ))
         .unwrap();
 
-    registry.broadcast_node_joined(NodeId(42));
+    registry.broadcast_node_joined(NodeId("42".to_string()));
 
     assert_eq!(j1.load(Ordering::SeqCst), 1);
     assert_eq!(j2.load(Ordering::SeqCst), 1);
@@ -225,7 +225,7 @@ fn reg_06_broadcast_node_left() {
         ))
         .unwrap();
 
-    registry.broadcast_node_left(NodeId(7));
+    registry.broadcast_node_left(NodeId("7".to_string()));
 
     assert_eq!(l1.load(Ordering::SeqCst), 1);
     assert_eq!(l2.load(Ordering::SeqCst), 1);
