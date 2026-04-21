@@ -1,5 +1,12 @@
 # Integration Test Plan — dstate
 
+> **⚠️ Historical Document (v0.1):** This integration test plan was written for the
+> v0.1 architecture with `MockRuntime` implementing `dstate::ActorRuntime`. As of v1.0,
+> `ActorRuntime` has been removed and integration testing uses `dstate-integration`
+> with `MockCluster` and `DistributedStateEngine` directly.
+> See [distributed-state-design.md §6.0](./distributed-state-design.md#60-actor-runtime--dactor-integration)
+> for the current architecture.
+
 ## Overview
 
 This document describes the integration test framework and test matrix for
