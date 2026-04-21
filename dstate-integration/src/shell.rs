@@ -23,6 +23,7 @@ use dactor::test_support::test_runtime::TestActorRef;
 use dactor::ActorRef;
 use dactor::NodeId;
 use dactor_mock::MockNetwork;
+use tokio_util::sync::CancellationToken;
 
 use dstate::engine::{
     DistributedStateEngine, EngineAction, EngineQueryResult, WireMessage,
@@ -145,6 +146,9 @@ where
     peers: PeerRegistry<S, V>,
     network: Arc<MockNetwork>,
     own_node_id: NodeId,
+    /// Cancellation token for outstanding delayed sync tasks.
+    /// Cancelled on actor stop to prevent stale messages from previous incarnations.
+    cancel_token: CancellationToken,
 }
 
 impl<S, V> DstateActor<S, V>
@@ -178,25 +182,31 @@ where
                     }
                 }
                 EngineAction::ScheduleDelayed { delay, message } => {
-                    // For simplicity in mock tests, broadcast immediately
-                    // after delay via tokio::spawn. In production, this would
-                    // use dactor's timer facility.
+                    // Broadcast after delay. The task is tied to the actor's
+                    // cancel_token so it won't fire after actor stop/restart.
                     let peers_clone = self.peers.clone();
                     let network = self.network.clone();
                     let own_id = self.own_node_id.clone();
+                    let token = self.cancel_token.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let peers = peers_clone.lock().unwrap();
-                        for (peer_id, peer_ref) in peers.iter() {
-                            if peer_id == &own_id {
-                                continue;
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {
+                                let peers = peers_clone.lock().unwrap();
+                                for (peer_id, peer_ref) in peers.iter() {
+                                    if peer_id == &own_id {
+                                        continue;
+                                    }
+                                    if !network.can_deliver(&own_id, peer_id) {
+                                        continue;
+                                    }
+                                    let _ = peer_ref.tell(InboundSync {
+                                        message: message.clone(),
+                                    });
+                                }
                             }
-                            if !network.can_deliver(&own_id, peer_id) {
-                                continue;
+                            _ = token.cancelled() => {
+                                // Actor stopped — discard delayed message
                             }
-                            let _ = peer_ref.tell(InboundSync {
-                                message: message.clone(),
-                            });
                         }
                     });
                 }
@@ -220,7 +230,13 @@ where
             peers: args.peers,
             network: args.network,
             own_node_id: args.own_node_id,
+            cancel_token: CancellationToken::new(),
         }
+    }
+
+    async fn on_stop(&mut self) {
+        // Cancel all outstanding delayed sync tasks
+        self.cancel_token.cancel();
     }
 }
 
@@ -308,7 +324,10 @@ where
                 self.route_actions(actions);
             }
             ClusterChange::NodeLeft { node_id } => {
-                self.engine.on_node_left(node_id);
+                self.engine.on_node_left(node_id.clone());
+                // Remove from routing table so broadcasts no longer target this peer
+                let mut peers = self.peers.lock().unwrap();
+                peers.remove(&node_id);
             }
         }
     }
