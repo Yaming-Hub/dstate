@@ -2,28 +2,27 @@
 //!
 //! Integration test framework for the [`dstate`] distributed state crate.
 //!
-//! Provides a deterministic mock cluster environment for testing the
-//! replication protocol end-to-end without a real actor runtime.
+//! Provides two testing approaches:
 //!
-//! # Architecture
+//! 1. **Deterministic MockCluster** — drives `DistributedStateEngine` instances
+//!    directly with a tick-based simulation loop. Fast, repeatable, and used for
+//!    the primary protocol correctness test suite.
 //!
-//! This framework drives
-//! [`DistributedStateEngine`](dstate::engine::DistributedStateEngine)
-//! instances directly — no actor runtime needed. The engine's action-based
-//! API (`Vec<EngineAction>`) makes this possible — the
-//! [`MockCluster`](cluster::MockCluster) executes all outbound effects
-//! through a [`MockTransport`](transport::MockTransport) that serializes
-//! messages to bytes, routes them through an interceptor pipeline, and
-//! delivers them to target engines.
+//! 2. **dactor-mock Shell** — wraps `DistributedStateEngine` in a dactor actor
+//!    ([`shell::DstateActor`]) and tests through async message passing with
+//!    `dactor-mock`'s `MockCluster`. Proves dstate works within a dactor actor
+//!    system with network partitions and node crash/restart.
 //!
 //! # Modules
 //!
 //! - [`interceptor`] — Network interceptor trait + built-in fault injectors
 //! - [`transport`] — Byte-level message routing between nodes
 //! - [`cluster`] — MockCluster orchestrator with `tick()`/`settle()`
+//! - [`shell`] — dactor actor shell wrapping `DistributedStateEngine`
 //!
 //! See `docs/integration-test-plan.md` for the full test matrix.
 
 pub mod interceptor;
 pub mod transport;
 pub mod cluster;
+pub mod shell;
