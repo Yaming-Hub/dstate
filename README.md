@@ -133,11 +133,14 @@ in-memory mock cluster with fault injection at the actor framework layer.
 | Harness | 5 | MockCluster API validation |
 | dactor mock | 5 | Actor shell with mock cluster |
 
-### Example
+### Examples
 
-See [`dstate/examples/node_resource.rs`](dstate/examples/node_resource.rs) for
-a complete `DeltaDistributedState` implementation with threshold-based sync
-urgency, delta synchronization, and cross-node queries.
+- [`dstate/examples/engine_demo.rs`](dstate/examples/engine_demo.rs) — Runnable
+  multi-node demo showing the `DistributedStateEngine` API: cluster setup,
+  mutations, action routing, node departure, metrics, and health checks.
+- [`dstate/examples/node_resource.rs`](dstate/examples/node_resource.rs) — A
+  complete `DeltaDistributedState` implementation with threshold-based sync
+  urgency, delta synchronization, and cross-node queries.
 
 ```rust
 use dstate::test_support::test_runtime::TestClusterEvents;

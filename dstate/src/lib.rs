@@ -14,6 +14,50 @@
 //! - [`StatePersistence`] — Async save/load for crash recovery
 //! - [`Clock`] — Time abstraction for deterministic testing
 //!
+//! ## Quick Start
+//!
+//! ```rust
+//! use dstate::{DistributedState, DeserializeError};
+//! use serde::{Serialize, Deserialize};
+//!
+//! #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+//! struct Counter { value: u64 }
+//!
+//! impl DistributedState for Counter {
+//!     fn name() -> &'static str { "counter" }
+//!     const WIRE_VERSION: u32 = 1;
+//!     const STORAGE_VERSION: u32 = 1;
+//!
+//!     fn serialize_state(&self) -> Vec<u8> {
+//!         bincode::serialize(self).unwrap()
+//!     }
+//!     fn deserialize_state(bytes: &[u8], _v: u32) -> Result<Self, DeserializeError> {
+//!         bincode::deserialize(bytes)
+//!             .map_err(|e| DeserializeError::Malformed(e.to_string()))
+//!     }
+//! }
+//! ```
+//!
+//! Then create a [`DistributedStateEngine`] to drive replication:
+//!
+//! ```rust,ignore
+//! use dstate::engine::DistributedStateEngine;
+//! use dstate::{StateConfig, SyncStrategy, SyncUrgency};
+//!
+//! let engine = DistributedStateEngine::new(
+//!     "counter", node_id, Counter::default(), |s| s.clone(),
+//!     StateConfig { sync_strategy: SyncStrategy::active_push(), ..Default::default() },
+//!     1, clock, |v| serialize(v), |b, v| deserialize(b, v), None,
+//! );
+//!
+//! // Mutate → get actions → route to peers
+//! let result = engine.mutate(|s| s.value += 1, |s| s.clone(), SyncUrgency::Default);
+//! for action in result.actions { /* send to peers */ }
+//! ```
+//!
+//! See `examples/engine_demo.rs` for a complete multi-node example and
+//! `examples/node_resource.rs` for a `DeltaDistributedState` implementation.
+//!
 //! ## Actor Runtime (via dactor)
 //!
 //! Actor spawning, messaging, timers, groups, and cluster events are provided

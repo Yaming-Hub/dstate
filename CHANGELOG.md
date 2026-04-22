@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `dactor` dependency for actor framework integration.
 - `TestTimerHandle::new()` constructor for creating test timer handles.
+- **Engine demo** (`dstate/examples/engine_demo.rs`) — A runnable multi-node
+  example demonstrating the `DistributedStateEngine` API: cluster setup,
+  mutations, action routing, node departure, metrics, and health checks.
 - **NodeResource example** (`dstate/examples/node_resource.rs`) — A complete
   `DeltaDistributedState` implementation demonstrating private vs. public fields,
   delta synchronization, threshold-based sync urgency, and cross-node queries.
