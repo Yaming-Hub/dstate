@@ -120,6 +120,25 @@ multi-node integration scenarios. For actor-level testing, see
 [`dactor-mock`](https://crates.io/crates/dactor-mock) which provides an
 in-memory mock cluster with fault injection at the actor framework layer.
 
+### Test Suites
+
+| Suite | Tests | Description |
+|-------|-------|-------------|
+| Unit tests | 205+ | Core logic, engine, sync, persistence, versioning |
+| Happy path | 15 | Multi-node replication scenarios |
+| Fault injection | 13 | Partitions, drops, corruption, duplicates |
+| Stress | 3 | High throughput, 10-node mesh, large payloads |
+| Chaos | 6 | Delays, packet loss, crash/rejoin, split-brain |
+| Upgrade | 4 | Rolling V1→V2 upgrade, rollback, mixed versions |
+| Harness | 5 | MockCluster API validation |
+| dactor mock | 5 | Actor shell with mock cluster |
+
+### Example
+
+See [`dstate/examples/node_resource.rs`](dstate/examples/node_resource.rs) for
+a complete `DeltaDistributedState` implementation with threshold-based sync
+urgency, delta synchronization, and cross-node queries.
+
 ```rust
 use dstate::test_support::test_runtime::TestClusterEvents;
 use dstate::test_support::test_clock::TestClock;
