@@ -5,9 +5,8 @@
 //!
 //! 1. Creating engines with `DistributedState` types
 //! 2. Mutating state and routing the resulting `EngineAction`s
-//! 3. Querying the cluster-wide view map
-//! 4. Handling node join/leave events
-//! 5. Periodic sync and change feed flushing
+//! 3. Querying the cluster-wide view map (with action routing)
+//! 4. Handling node join/leave events (routing join snapshots)
 //!
 //! In a real system, the routing would be done by an actor shell (see
 //! `dstate-integration/src/shell.rs` for an example using dactor-mock).
@@ -40,7 +39,10 @@ impl DistributedState for Counter {
     fn serialize_state(&self) -> Vec<u8> {
         bincode::serialize(self).unwrap()
     }
-    fn deserialize_state(bytes: &[u8], _version: u32) -> Result<Self, DeserializeError> {
+    fn deserialize_state(bytes: &[u8], version: u32) -> Result<Self, DeserializeError> {
+        if version != Self::WIRE_VERSION {
+            return Err(DeserializeError::unknown_version(version));
+        }
         bincode::deserialize(bytes).map_err(|e| DeserializeError::Malformed(e.to_string()))
     }
 }
@@ -84,18 +86,29 @@ impl InProcessCluster {
             ids.push(id);
         }
 
-        // Announce all nodes to each other
+        // Announce all nodes to each other and route join snapshots
+        let mut join_actions: Vec<(NodeId, Vec<EngineAction>)> = Vec::new();
         for i in 0..ids.len() {
             for j in 0..ids.len() {
                 if i != j {
                     let peer_id = ids[j].clone();
                     let engine = engines.get_mut(&ids[i]).unwrap();
-                    engine.on_node_joined(peer_id, Counter::default());
+                    let actions = engine.on_node_joined(peer_id, Counter::default());
+                    if !actions.is_empty() {
+                        join_actions.push((ids[i].clone(), actions));
+                    }
                 }
             }
         }
 
-        Self { engines }
+        let mut cluster = Self { engines };
+
+        // Route join snapshots so all peers receive initial state
+        for (from, actions) in join_actions {
+            cluster.route_actions(from, actions);
+        }
+
+        cluster
     }
 
     /// Mutate a node's state and route resulting actions to peers.
@@ -154,9 +167,9 @@ impl InProcessCluster {
         }
     }
 
-    /// Query the view map from a node's perspective.
-    fn query(&self, node_id: &NodeId) -> HashMap<NodeId, u64> {
-        let (result, _actions) = self.engines[node_id].query(
+    /// Query the view map from a node's perspective, routing any stale-peer actions.
+    fn query(&mut self, node_id: &NodeId) -> HashMap<NodeId, u64> {
+        let (result, actions) = self.engines[node_id].query(
             Duration::from_secs(60),
             |views| {
                 views
@@ -165,6 +178,9 @@ impl InProcessCluster {
                     .collect::<HashMap<_, _>>()
             },
         );
+        if !actions.is_empty() {
+            self.route_actions(node_id.clone(), actions);
+        }
         match result {
             EngineQueryResult::Fresh(map) => map,
             EngineQueryResult::Stale { result: map, .. } => map,

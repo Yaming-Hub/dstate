@@ -31,7 +31,10 @@
 //!     fn serialize_state(&self) -> Vec<u8> {
 //!         bincode::serialize(self).unwrap()
 //!     }
-//!     fn deserialize_state(bytes: &[u8], _v: u32) -> Result<Self, DeserializeError> {
+//!     fn deserialize_state(bytes: &[u8], v: u32) -> Result<Self, DeserializeError> {
+//!         if v != Self::WIRE_VERSION {
+//!             return Err(DeserializeError::unknown_version(v));
+//!         }
 //!         bincode::deserialize(bytes)
 //!             .map_err(|e| DeserializeError::Malformed(e.to_string()))
 //!     }
