@@ -39,8 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Stress tests** (`dstate-integration/tests/stress_tests.rs`) — STRESS-01 to 03:
   high-throughput sequential mutations, 10-node full mesh convergence, large payload sync.
 - **Chaos tests** (`dstate-integration/tests/chaos_tests.rs`) — CHAOS-01 to 06:
-  delayed messages, packet loss recovery, crash/rejoin, rapid join/leave cycles,
-  split-brain partition and heal, generation ordering under clock skew.
+  delayed messages, best-effort delivery under packet loss, crash/rejoin,
+  rapid join/leave cycles, split-brain partition and heal, generation ordering
+  under clock skew.
 - **Upgrade tests** (`dstate-integration/tests/upgrade_tests.rs`) — UPGRADE-01 to 04:
   rolling phase 1 upgrade (read V1+V2, send V1), rolling phase 2 (send V2),
   partial rollback, mixed-version steady state under load.

@@ -3,8 +3,8 @@
 //! Demonstrates a realistic distributed state type for monitoring cluster node
 //! resources (CPU, memory, disk). Shows:
 //!
-//! - **Private vs public fields**: `sample_count` and `cpu_accumulator` are
-//!   private (internal bookkeeping); only aggregate metrics are in the view.
+//! - **State vs view separation**: `sample_count` and `cpu_accumulator` are
+//!   internal bookkeeping (not `pub`); only aggregate metrics appear in the view.
 //! - **Delta synchronization**: Only changed resource metrics are sent to peers.
 //! - **Dynamic sync urgency**: Large memory spikes → `Immediate`; small CPU
 //!   jitter → `Suppress`; moderate changes → `Default`.
@@ -19,9 +19,9 @@ use std::fmt;
 /// Internal state with private bookkeeping fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeResourceState {
-    // Private — not visible to peers:
-    pub sample_count: u64,
-    pub cpu_accumulator: f64,
+    // Not included in the replicated view:
+    sample_count: u64,
+    cpu_accumulator: f64,
     // Public metrics:
     pub cpu_usage_pct: f64,
     pub memory_used_bytes: u64,
@@ -131,7 +131,7 @@ pub struct NodeResourceDelta {
 /// Application-level change description (what the mutation changed).
 #[derive(Debug, Clone)]
 pub enum NodeResourceChange {
-    CpuSample { cpu_pct: f64 },
+    CpuSample { new_cpu_usage_pct: f64 },
     MemoryUpdate { used: u64, total: u64 },
     DiskUpdate { used: u64, total: u64 },
 }
@@ -170,8 +170,8 @@ impl DeltaDistributedState for NodeResource {
 
     fn project_delta(change: &Self::StateDeltaChange) -> Self::ViewDelta {
         match change {
-            NodeResourceChange::CpuSample { .. } => NodeResourceDelta {
-                cpu_usage_pct: None, // CPU is set by project_view after accumulation
+            NodeResourceChange::CpuSample { new_cpu_usage_pct } => NodeResourceDelta {
+                cpu_usage_pct: Some(*new_cpu_usage_pct),
                 memory_used_bytes: None,
                 memory_total_bytes: None,
                 disk_used_bytes: None,
@@ -361,7 +361,7 @@ mod tests {
             cpu_usage_pct: 50.5,
             ..Default::default()
         };
-        let change = NodeResourceChange::CpuSample { cpu_pct: 50.5 };
+        let change = NodeResourceChange::CpuSample { new_cpu_usage_pct: 50.5 };
         assert!(matches!(
             NodeResource::sync_urgency(&old, &new, &change),
             SyncUrgency::Suppress

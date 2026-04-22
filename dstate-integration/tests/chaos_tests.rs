@@ -70,9 +70,14 @@ fn chaos_01_delayed_messages_converge() {
 }
 
 // ── CHAOS-02: Packet loss (10% drop rate) ───────────────────────
+//
+// With active_push, each mutation broadcasts a full snapshot.
+// Even with 10% loss, later snapshots carry the latest state,
+// so peers make progress. This tests best-effort delivery under
+// loss, not guaranteed convergence (which requires periodic sync).
 
 #[test]
-fn chaos_02_packet_loss_recovery() {
+fn chaos_02_packet_loss_best_effort_delivery() {
     let mut cluster = MockCluster::with_test_state(3, active_push_config());
 
     cluster
