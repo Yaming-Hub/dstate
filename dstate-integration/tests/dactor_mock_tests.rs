@@ -82,31 +82,30 @@ fn make_engine(node_id: &str, clock: Arc<TestClock>) -> DistributedStateEngine<T
     )
 }
 
-/// Build per-actor peer registries with partition-aware senders.
-fn build_peer_registries(
+/// Populate per-actor peer registries with partition-aware senders.
+///
+/// Each actor gets senders that know the correct from/to nodes for
+/// partition checks. Clears existing entries before populating.
+fn populate_peer_registries(
+    registries: &HashMap<String, PeerRegistry>,
     actors: &HashMap<String, TestActorRef<StateActor<TestState, TestState>>>,
     network: &Arc<MockNetwork>,
-) -> HashMap<String, PeerRegistry> {
-    let mut registries = HashMap::new();
-    for (id, _) in actors {
-        let registry = new_peer_registry();
-        {
-            let mut peers = registry.lock().unwrap();
-            for (peer_id, peer_ref) in actors {
-                if peer_id != id {
-                    let sender = PartitionAwarePeerSender {
-                        inner: ActorRefPeerSender::new(peer_ref.clone()),
-                        network: network.clone(),
-                        from: NodeId(id.to_string()),
-                        to: NodeId(peer_id.to_string()),
-                    };
-                    peers.insert(NodeId(peer_id.to_string()), Arc::new(sender));
-                }
+) {
+    for (id, registry) in registries {
+        let mut peers = registry.lock().unwrap();
+        peers.clear();
+        for (peer_id, peer_ref) in actors {
+            if peer_id != id {
+                let sender = PartitionAwarePeerSender {
+                    inner: ActorRefPeerSender::new(peer_ref.clone()),
+                    network: network.clone(),
+                    from: NodeId(id.to_string()),
+                    to: NodeId(peer_id.to_string()),
+                };
+                peers.insert(NodeId(peer_id.to_string()), Arc::new(sender));
             }
         }
-        registries.insert(id.clone(), registry);
     }
-    registries
 }
 
 /// Spawn StateActor instances on a dactor-mock cluster and wire them together.
@@ -148,20 +147,7 @@ async fn setup_cluster(
     }
 
     // Phase 2: populate peer registries with partition-aware senders
-    for (id, registry) in &registries {
-        let mut peers = registry.lock().unwrap();
-        for (peer_id, peer_ref) in &actors {
-            if peer_id != id {
-                let sender = PartitionAwarePeerSender {
-                    inner: ActorRefPeerSender::new(peer_ref.clone()),
-                    network: network.clone(),
-                    from: NodeId(id.to_string()),
-                    to: NodeId(peer_id.to_string()),
-                };
-                peers.insert(NodeId(peer_id.to_string()), Arc::new(sender));
-            }
-        }
-    }
+    populate_peer_registries(&registries, &actors, &network);
 
     // Phase 3: announce cluster membership
     for &id in node_ids {
@@ -357,21 +343,7 @@ async fn mock_03_crash_and_restart() {
     actors.insert("n2".to_string(), new_n2.clone());
 
     // Rebuild peer registries for all nodes to include new n2
-    for (id, registry) in &registries {
-        let mut peers = registry.lock().unwrap();
-        peers.clear();
-        for (peer_id, peer_ref) in &actors {
-            if peer_id != id {
-                let sender = PartitionAwarePeerSender {
-                    inner: ActorRefPeerSender::new(peer_ref.clone()),
-                    network: network.clone(),
-                    from: NodeId(id.to_string()),
-                    to: NodeId(peer_id.to_string()),
-                };
-                peers.insert(NodeId(peer_id.to_string()), Arc::new(sender));
-            }
-        }
-    }
+    populate_peer_registries(&registries, &actors, &network);
 
     // Announce n2 rejoining to all nodes
     for id in &["n1", "n3"] {
