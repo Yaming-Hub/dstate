@@ -118,6 +118,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dstate-dactor"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "dactor",
+ "dactor-mock",
+ "dstate",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "dstate-integration"
 version = "1.0.0"
 dependencies = [
