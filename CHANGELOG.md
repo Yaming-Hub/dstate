@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `dactor` dependency for actor framework integration.
 - `TestTimerHandle::new()` constructor for creating test timer handles.
+- **`dstate-dactor` crate** — Actor hosting for `DistributedStateEngine` using the
+  `dactor` framework. Provides `StateActor<S, V>`, a thin wrapper that bridges the
+  engine's action-based API with dactor's message-passing model. Includes typed messages
+  (`Mutate`, `QueryViews`, `InboundSync`, `ClusterChange`, `PeriodicSync`,
+  `FlushChangeFeed`), a `PeerSender` trait for abstracting peer routing, and
+  `ActorRefPeerSender` for concrete dactor `ActorRef` integration.
 - **Engine demo** (`dstate/examples/engine_demo.rs`) — A runnable multi-node
   example demonstrating the `DistributedStateEngine` API: cluster setup,
   mutations, action routing, node departure, metrics, and health checks.

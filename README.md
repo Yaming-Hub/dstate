@@ -16,6 +16,7 @@ crate and its adapter crates (`dactor-ractor`, `dactor-kameo`, `dactor-coerce`).
 | Crate | Description |
 |-------|-------------|
 | [`dstate`](dstate/) | Core library — traits, types, replication logic, test support |
+| [`dstate-dactor`](dstate-dactor/) | Actor hosting — wraps `DistributedStateEngine` as a `dactor` actor |
 | [`dstate-integration`](dstate-integration/) | Integration tests for multi-node scenarios |
 
 ## Quick Start
@@ -25,6 +26,7 @@ Add `dstate` and a `dactor` adapter to your `Cargo.toml`:
 ```toml
 [dependencies]
 dstate = "1"
+dstate-dactor = "1"    # actor hosting
 dactor-ractor = "0.2"   # or dactor-kameo, dactor-coerce
 ```
 

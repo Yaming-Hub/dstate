@@ -1,0 +1,26 @@
+[package]
+name = "dstate-dactor"
+version = "1.0.0"
+edition = "2021"
+description = "dactor actor hosting for dstate distributed state replication"
+license = "MIT"
+repository = "https://github.com/Yaming-Hub/dstate"
+homepage = "https://github.com/Yaming-Hub/dstate"
+readme = "../README.md"
+keywords = ["distributed", "state", "actor", "dactor", "replication"]
+categories = ["concurrency", "network-programming"]
+
+[dependencies]
+dstate = { path = "../dstate" }
+dactor = { version = "0.2", features = ["serde"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["time", "sync", "rt"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[dev-dependencies]
+dactor = { version = "0.2", features = ["serde", "test-support"] }
+dactor-mock = "0.2"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full", "test-util"] }
