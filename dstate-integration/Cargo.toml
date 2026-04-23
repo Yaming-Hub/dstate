@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 dstate = { path = "../dstate" }
+dstate-dactor = { path = "../dstate-dactor" }
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
 dactor = { version = "0.2", features = ["test-support"] }

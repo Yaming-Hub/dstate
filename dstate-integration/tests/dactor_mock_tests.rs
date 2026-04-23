@@ -1,30 +1,64 @@
-//! Functional tests using dactor-mock to exercise dstate through the actor shell.
+//! Functional tests using dactor-mock + dstate-dactor to exercise dstate
+//! through the actor framework.
 //!
 //! These tests complement the deterministic MockCluster tests by proving
 //! that dstate works correctly within a dactor actor system with async
 //! message passing, network partitions, and node crash/restart.
+//!
+//! Uses `dstate_dactor::StateActor` with a `PartitionAwarePeerSender` that
+//! wraps `ActorRefPeerSender` with `MockNetwork::can_deliver()` checks.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dactor::actor::ActorRef;
 use dactor::test_support::test_runtime::TestActorRef;
 use dactor::NodeId;
-use dactor_mock::MockCluster;
+use dactor_mock::{MockCluster, MockNetwork};
 
-use dstate::engine::DistributedStateEngine;
+use dstate::engine::{DistributedStateEngine, WireMessage};
 use dstate::test_support::test_clock::TestClock;
 use dstate::test_support::test_state::TestState;
-use dstate::{DeserializeError, DistributedState, StateConfig, SyncUrgency};
+use dstate::{DeserializeError, DistributedState, StateConfig, SyncMessage, SyncUrgency};
 
-use dstate_integration::shell::*;
+use dstate_dactor::{
+    ActorRefPeerSender, ClusterChange, FlushChangeFeed, Mutate, PeerRegistry, PeerSender,
+    PeriodicSync, QueryViews, StateActor, StateActorArgs, new_peer_registry,
+};
+
+// ── Partition-aware peer sender ─────────────────────────────────
+
+/// A `PeerSender` that checks `MockNetwork::can_deliver()` before forwarding.
+///
+/// Each instance knows its source (`from`) and target (`to`) node, so
+/// partition checks are per-link. This requires per-actor peer registries
+/// (each actor stores senders with its own `from` node).
+struct PartitionAwarePeerSender {
+    inner: ActorRefPeerSender<TestState, TestState, TestActorRef<StateActor<TestState, TestState>>>,
+    network: Arc<MockNetwork>,
+    from: NodeId,
+    to: NodeId,
+}
+
+impl PeerSender for PartitionAwarePeerSender {
+    fn send_sync(&self, message: SyncMessage) {
+        if self.network.can_deliver(&self.from, &self.to) {
+            self.inner.send_sync(message);
+        }
+    }
+
+    fn send_wire(&self, message: WireMessage) {
+        if self.network.can_deliver(&self.from, &self.to) {
+            self.inner.send_wire(message);
+        }
+    }
+}
 
 // ── Test helpers ────────────────────────────────────────────────
 
 /// Create a TestState engine for a given node.
 fn make_engine(node_id: &str, clock: Arc<TestClock>) -> DistributedStateEngine<TestState, TestState> {
-    // Enable periodic sync for partition-heal tests
     let config = StateConfig {
         sync_strategy: dstate::SyncStrategy::feed_with_periodic_sync(Duration::from_secs(1)),
         ..StateConfig::default()
@@ -48,52 +82,88 @@ fn make_engine(node_id: &str, clock: Arc<TestClock>) -> DistributedStateEngine<T
     )
 }
 
-/// Spawn DstateActor instances on a dactor-mock cluster and wire them together.
+/// Build per-actor peer registries with partition-aware senders.
+fn build_peer_registries(
+    actors: &HashMap<String, TestActorRef<StateActor<TestState, TestState>>>,
+    network: &Arc<MockNetwork>,
+) -> HashMap<String, PeerRegistry> {
+    let mut registries = HashMap::new();
+    for (id, _) in actors {
+        let registry = new_peer_registry();
+        {
+            let mut peers = registry.lock().unwrap();
+            for (peer_id, peer_ref) in actors {
+                if peer_id != id {
+                    let sender = PartitionAwarePeerSender {
+                        inner: ActorRefPeerSender::new(peer_ref.clone()),
+                        network: network.clone(),
+                        from: NodeId(id.to_string()),
+                        to: NodeId(peer_id.to_string()),
+                    };
+                    peers.insert(NodeId(peer_id.to_string()), Arc::new(sender));
+                }
+            }
+        }
+        registries.insert(id.clone(), registry);
+    }
+    registries
+}
+
+/// Spawn StateActor instances on a dactor-mock cluster and wire them together.
 async fn setup_cluster(
     node_ids: &[&str],
 ) -> (
     MockCluster,
-    HashMap<String, TestActorRef<DstateActor<TestState, TestState>>>,
-    PeerRegistry<TestState, TestState>,
+    HashMap<String, TestActorRef<StateActor<TestState, TestState>>>,
+    HashMap<String, PeerRegistry>,
     Arc<TestClock>,
-    Arc<dactor_mock::MockNetwork>,
+    Arc<MockNetwork>,
 ) {
     let clock = Arc::new(TestClock::with_base_unix_ms(1_000_000));
     let cluster = MockCluster::new(node_ids);
-    // Create a separate MockNetwork for dstate-level message routing.
-    // This is independent from dactor-mock's cluster-level network.
-    let network = Arc::new(dactor_mock::MockNetwork::new());
-    let peers: PeerRegistry<TestState, TestState> = Arc::new(Mutex::new(HashMap::new()));
+    let network = Arc::new(MockNetwork::new());
 
     let mut actors = HashMap::new();
 
-    // Spawn an actor on each node
+    // Phase 1: spawn actors with empty peer registries
+    let mut registries: HashMap<String, PeerRegistry> = HashMap::new();
     for &id in node_ids {
         let engine = make_engine(id, clock.clone());
-        let args = DstateActorArgs {
+        let peers = new_peer_registry();
+        registries.insert(id.to_string(), peers.clone());
+
+        let args = StateActorArgs {
             engine,
             peers: peers.clone(),
-            network: network.clone(),
-            own_node_id: NodeId(id.to_string()),
         };
 
         let actor_ref = cluster
             .node(id)
             .runtime
-            .spawn::<DstateActor<TestState, TestState>>(&format!("dstate-{}", id), args)
+            .spawn::<StateActor<TestState, TestState>>(&format!("dstate-{id}"), args)
             .await
             .expect("spawn should succeed");
-
-        // Register in peer registry
-        {
-            let mut p = peers.lock().unwrap();
-            p.insert(NodeId(id.to_string()), actor_ref.clone());
-        }
 
         actors.insert(id.to_string(), actor_ref);
     }
 
-    // Announce all nodes to each other
+    // Phase 2: populate peer registries with partition-aware senders
+    for (id, registry) in &registries {
+        let mut peers = registry.lock().unwrap();
+        for (peer_id, peer_ref) in &actors {
+            if peer_id != id {
+                let sender = PartitionAwarePeerSender {
+                    inner: ActorRefPeerSender::new(peer_ref.clone()),
+                    network: network.clone(),
+                    from: NodeId(id.to_string()),
+                    to: NodeId(peer_id.to_string()),
+                };
+                peers.insert(NodeId(peer_id.to_string()), Arc::new(sender));
+            }
+        }
+    }
+
+    // Phase 3: announce cluster membership
     for &id in node_ids {
         let actor = &actors[id];
         for &peer_id in node_ids {
@@ -111,12 +181,12 @@ async fn setup_cluster(
     // Give actors time to process cluster join messages and exchange snapshots
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    (cluster, actors, peers, clock, network)
+    (cluster, actors, registries, clock, network)
 }
 
-/// Helper: mutate state on a node via the actor shell.
+/// Helper: mutate state on a node.
 fn tell_mutate(
-    actor: &TestActorRef<DstateActor<TestState, TestState>>,
+    actor: &TestActorRef<StateActor<TestState, TestState>>,
     counter: u64,
     label: &str,
 ) {
@@ -133,12 +203,12 @@ fn tell_mutate(
         .expect("tell mutate should succeed");
 }
 
-/// Helper: query the view map on a node via the actor shell.
+/// Helper: query the view map on a node.
 async fn ask_query(
-    actor: &TestActorRef<DstateActor<TestState, TestState>>,
+    actor: &TestActorRef<StateActor<TestState, TestState>>,
 ) -> HashMap<NodeId, dstate::StateViewObject<TestState>> {
     let reply = actor
-        .ask(QueryAll::<TestState>::new(Duration::from_secs(60)), None)
+        .ask(QueryViews::<TestState>::new(Duration::from_secs(60)), None)
         .expect("ask should succeed")
         .await
         .expect("query should succeed");
@@ -152,7 +222,7 @@ async fn ask_query(
 /// Mutate on node-1, verify node-2 and node-3 receive the update.
 #[tokio::test]
 async fn mock_01_basic_replication() {
-    let (_cluster, actors, _peers, _clock, _network) = setup_cluster(&["n1", "n2", "n3"]).await;
+    let (_cluster, actors, _registries, _clock, _network) = setup_cluster(&["n1", "n2", "n3"]).await;
 
     // Mutate on n1
     tell_mutate(&actors["n1"], 42, "hello");
@@ -180,7 +250,7 @@ async fn mock_01_basic_replication() {
 /// Partition n1 from n2, verify n2 doesn't get n1's update but n3 does.
 #[tokio::test]
 async fn mock_02_network_partition() {
-    let (_cluster, actors, _peers, _clock, network) = setup_cluster(&["n1", "n2", "n3"]).await;
+    let (_cluster, actors, _registries, _clock, network) = setup_cluster(&["n1", "n2", "n3"]).await;
 
     // Partition n1 <-> n2
     let n1_id = NodeId("n1".to_string());
@@ -232,7 +302,7 @@ async fn mock_02_network_partition() {
 /// Node n2 crashes (actor stops), a new n2 is spawned and rejoins.
 #[tokio::test]
 async fn mock_03_crash_and_restart() {
-    let (mut cluster, mut actors, peers, clock, network) = setup_cluster(&["n1", "n2", "n3"]).await;
+    let (mut cluster, mut actors, mut registries, clock, network) = setup_cluster(&["n1", "n2", "n3"]).await;
 
     // Mutate on n1 before crash
     tell_mutate(&actors["n1"], 10, "before-crash");
@@ -265,31 +335,43 @@ async fn mock_03_crash_and_restart() {
     tell_mutate(&actors["n1"], 20, "during-crash");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Restart n2 with fresh engine
+    // Restart n2 with fresh engine and new per-actor peer registry
     cluster.restart_node("n2");
 
     let engine = make_engine("n2", clock.clone());
-    let args = DstateActorArgs {
+    let new_peers = new_peer_registry();
+    registries.insert("n2".to_string(), new_peers.clone());
+
+    let args = StateActorArgs {
         engine,
-        peers: peers.clone(),
-        network: network.clone(),
-        own_node_id: n2_id.clone(),
+        peers: new_peers.clone(),
     };
 
     let new_n2 = cluster
         .node("n2")
         .runtime
-        .spawn::<DstateActor<TestState, TestState>>("dstate-n2", args)
+        .spawn::<StateActor<TestState, TestState>>("dstate-n2", args)
         .await
         .expect("spawn should succeed");
 
-    // Update peer registry
-    {
-        let mut p = peers.lock().unwrap();
-        p.insert(n2_id.clone(), new_n2.clone());
-    }
-
     actors.insert("n2".to_string(), new_n2.clone());
+
+    // Rebuild peer registries for all nodes to include new n2
+    for (id, registry) in &registries {
+        let mut peers = registry.lock().unwrap();
+        peers.clear();
+        for (peer_id, peer_ref) in &actors {
+            if peer_id != id {
+                let sender = PartitionAwarePeerSender {
+                    inner: ActorRefPeerSender::new(peer_ref.clone()),
+                    network: network.clone(),
+                    from: NodeId(id.to_string()),
+                    to: NodeId(peer_id.to_string()),
+                };
+                peers.insert(NodeId(peer_id.to_string()), Arc::new(sender));
+            }
+        }
+    }
 
     // Announce n2 rejoining to all nodes
     for id in &["n1", "n3"] {
@@ -328,7 +410,7 @@ async fn mock_03_crash_and_restart() {
 /// Partition n1 from all, mutate on n1, heal, periodic sync propagates.
 #[tokio::test]
 async fn mock_04_periodic_sync_after_heal() {
-    let (_cluster, actors, _peers, _clock, network) = setup_cluster(&["n1", "n2"]).await;
+    let (_cluster, actors, _registries, _clock, network) = setup_cluster(&["n1", "n2"]).await;
 
     let n1_id = NodeId("n1".to_string());
     let n2_id = NodeId("n2".to_string());
@@ -378,7 +460,7 @@ async fn mock_04_periodic_sync_after_heal() {
 /// Mutate on n1, flush change feed, verify n2 receives the feed batch.
 #[tokio::test]
 async fn mock_05_change_feed_flush() {
-    let (_cluster, actors, _peers, _clock, _network) = setup_cluster(&["n1", "n2"]).await;
+    let (_cluster, actors, _registries, _clock, _network) = setup_cluster(&["n1", "n2"]).await;
 
     // Mutate on n1 to generate a change feed notification
     tell_mutate(&actors["n1"], 50, "feed-test");
