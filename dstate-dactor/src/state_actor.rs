@@ -36,7 +36,11 @@ pub trait PeerSender: Send + Sync + 'static {
     fn send_wire(&self, message: WireMessage);
 }
 
-/// A `PeerSender` backed by a dactor `ActorRef<StateActor<S, V>>`.
+/// A local-only `PeerSender` backed by a dactor `ActorRef<StateActor<S, V>>`.
+///
+/// This works with any local `ActorRef` (including `TestActorRef`).
+/// For cross-node communication via remote actors, provide a custom
+/// `PeerSender` implementation that serializes messages for the wire.
 pub struct ActorRefPeerSender<S, V, R>
 where
     S: Clone + Send + Sync + 'static,
@@ -68,18 +72,22 @@ where
     R: ActorRef<StateActor<S, V>>,
 {
     fn send_sync(&self, message: SyncMessage) {
-        let _ = self.actor_ref.tell(InboundSync { message });
+        if let Err(e) = self.actor_ref.tell(InboundSync { message }) {
+            tracing::warn!("failed to send sync to peer: {e}");
+        }
     }
 
     fn send_wire(&self, message: WireMessage) {
-        let _ = self.actor_ref.tell(InboundWire { message });
+        if let Err(e) = self.actor_ref.tell(InboundWire { message }) {
+            tracing::warn!("failed to send wire message to peer: {e}");
+        }
     }
 }
 
 // ── Peer registry ───────────────────────────────────────────────
 
 /// Thread-safe registry of peer senders, keyed by NodeId.
-pub type PeerRegistry = Arc<std::sync::Mutex<HashMap<NodeId, Box<dyn PeerSender>>>>;
+pub type PeerRegistry = Arc<std::sync::Mutex<HashMap<NodeId, Arc<dyn PeerSender>>>>;
 
 /// Create an empty peer registry.
 pub fn new_peer_registry() -> PeerRegistry {
@@ -130,20 +138,27 @@ where
 
     /// Route engine actions to peer actors.
     fn route_actions(&self, actions: Vec<EngineAction>) {
-        let peers = self.peers.lock().unwrap();
         let own_id = self.engine.node_id();
+
+        // Clone senders out of the registry to avoid holding the lock during sends
+        let senders: Vec<(NodeId, Arc<dyn PeerSender>)> = {
+            let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+            peers
+                .iter()
+                .filter(|(id, _)| **id != own_id)
+                .map(|(id, s)| (id.clone(), Arc::clone(s)))
+                .collect()
+        };
 
         for action in actions {
             match action {
                 EngineAction::BroadcastSync(msg) => {
-                    for (peer_id, sender) in peers.iter() {
-                        if *peer_id != own_id {
-                            sender.send_sync(msg.clone());
-                        }
+                    for (_, sender) in &senders {
+                        sender.send_sync(msg.clone());
                     }
                 }
                 EngineAction::SendSync { target, message } => {
-                    if let Some(sender) = peers.get(&target) {
+                    if let Some((_, sender)) = senders.iter().find(|(id, _)| *id == target) {
                         sender.send_sync(message);
                     }
                 }
@@ -152,16 +167,26 @@ where
                     let own_id_clone = own_id.clone();
                     let token = self.cancel_token.clone();
                     tokio::spawn(async move {
+                        // Biased: prefer cancellation over delivery
                         tokio::select! {
+                            biased;
+                            _ = token.cancelled() => {}
                             _ = tokio::time::sleep(delay) => {
-                                let peers = peers_clone.lock().unwrap();
-                                for (peer_id, sender) in peers.iter() {
-                                    if *peer_id != own_id_clone {
-                                        sender.send_sync(message.clone());
-                                    }
+                                if token.is_cancelled() {
+                                    return;
+                                }
+                                let senders: Vec<Arc<dyn PeerSender>> = {
+                                    let peers = peers_clone.lock().unwrap_or_else(|e| e.into_inner());
+                                    peers
+                                        .iter()
+                                        .filter(|(id, _)| **id != own_id_clone)
+                                        .map(|(_, s)| Arc::clone(s))
+                                        .collect()
+                                };
+                                for sender in &senders {
+                                    sender.send_sync(message.clone());
                                 }
                             }
-                            _ = token.cancelled() => {}
                         }
                     });
                 }
@@ -281,7 +306,7 @@ where
             }
             ClusterChange::NodeLeft { node_id } => {
                 self.engine.on_node_left(node_id.clone());
-                let mut peers = self.peers.lock().unwrap();
+                let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
                 peers.remove(&node_id);
             }
         }
@@ -308,12 +333,17 @@ where
 {
     async fn handle(&mut self, _msg: FlushChangeFeed, _ctx: &mut ActorContext) {
         if let Some(feed) = self.engine.flush_change_feed() {
-            let peers = self.peers.lock().unwrap();
             let own_id = self.engine.node_id();
-            for (peer_id, sender) in peers.iter() {
-                if *peer_id != own_id {
-                    sender.send_wire(WireMessage::Feed(feed.clone()));
-                }
+            let senders: Vec<Arc<dyn PeerSender>> = {
+                let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+                peers
+                    .iter()
+                    .filter(|(id, _)| **id != own_id)
+                    .map(|(_, s)| Arc::clone(s))
+                    .collect()
+            };
+            for sender in &senders {
+                sender.send_wire(WireMessage::Feed(feed.clone()));
             }
         }
     }

@@ -1,8 +1,7 @@
 //! Integration tests for StateActor using dactor-mock.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Arc;use std::time::Duration;
 
 use dactor::actor::ActorRef;
 use dactor::test_support::test_runtime::TestActorRef;
@@ -75,9 +74,9 @@ async fn setup_cluster(
 
         // Register as peer sender
         {
-            let sender = ActorRefPeerSender::new(actor_ref.clone());
+            let sender = Arc::new(ActorRefPeerSender::new(actor_ref.clone()));
             let mut p = peers.lock().unwrap();
-            p.insert(NodeId(id.to_string()), Box::new(sender));
+            p.insert(NodeId(id.to_string()), sender);
         }
 
         actors.insert(id.to_string(), actor_ref);

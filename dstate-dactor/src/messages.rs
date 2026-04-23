@@ -25,31 +25,6 @@ impl<S: Send + 'static, V: Clone + Send + Sync + Debug + 'static> Message for Mu
     type Reply = ();
 }
 
-/// Fire-and-forget: apply a delta-aware mutation on this node.
-pub struct MutateDelta<S, V, VD, DC>
-where
-    S: Send + 'static,
-    V: Clone + Send + Sync + Debug + 'static,
-    VD: Clone + Send + Sync + Debug + 'static,
-    DC: Send + 'static,
-{
-    pub mutate_fn: Box<dyn FnOnce(&mut S) -> DC + Send>,
-    pub project_view_fn: Box<dyn FnOnce(&S) -> V + Send>,
-    pub project_delta_fn: Box<dyn FnOnce(&DC) -> VD + Send>,
-    pub urgency: SyncUrgency,
-    pub serialize_delta: Box<dyn FnOnce(&VD) -> Vec<u8> + Send>,
-}
-
-impl<S, V, VD, DC> Message for MutateDelta<S, V, VD, DC>
-where
-    S: Send + 'static,
-    V: Clone + Send + Sync + Debug + 'static,
-    VD: Clone + Send + Sync + Debug + 'static,
-    DC: Send + 'static,
-{
-    type Reply = ();
-}
-
 // ── Inbound sync ────────────────────────────────────────────────
 
 /// Fire-and-forget: deliver an inbound sync message from a peer.
