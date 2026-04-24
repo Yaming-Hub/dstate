@@ -62,6 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TestClusterEvents` and `TestTimerHandle` remain in `test_support::test_runtime`
   for testing cluster event handling and timer cancellation without an actor framework.
 - Updated design document (§1, §6.0, §16) to reflect dactor-based architecture.
+- **`dstate-integration` now uses `dstate-dactor::StateActor`** for dactor-mock
+  functional tests instead of its own `DstateActor` shell. The custom `shell` module
+  has been removed. Tests use `PartitionAwarePeerSender` to wrap `ActorRefPeerSender`
+  with `MockNetwork::can_deliver()` checks for network partition simulation.
 
 ### Migration Guide
 
