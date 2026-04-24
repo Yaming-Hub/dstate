@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use dactor::actor::{Actor, ActorContext, Handler};
@@ -17,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use dstate::engine::{
     DistributedStateEngine, EngineAction, EngineQueryResult, WireMessage,
 };
-use dstate::{SyncMessage, SyncUrgency};
+use dstate::SyncMessage;
 
 use crate::messages::*;
 
