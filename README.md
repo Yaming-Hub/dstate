@@ -27,7 +27,7 @@ Add `dstate` and a `dactor` adapter to your `Cargo.toml`:
 [dependencies]
 dstate = "1"
 dstate-dactor = "1"    # actor hosting
-dactor-ractor = "0.2"   # or dactor-kameo, dactor-coerce
+dactor-ractor = "0.3"   # or dactor-kameo, dactor-coerce
 ```
 
 ### Define a Distributed State

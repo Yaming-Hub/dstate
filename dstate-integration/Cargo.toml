@@ -11,8 +11,8 @@ dstate = { path = "../dstate" }
 dstate-dactor = { path = "../dstate-dactor" }
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
-dactor = { version = "0.2", features = ["test-support"] }
-dactor-mock = "0.2"
+dactor = { version = "0.3", features = ["test-support"] }
+dactor-mock = "0.3"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7"

@@ -5,7 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] — Unreleased
+## [1.1.0] — 2026-04-24
+
+### Changed
+
+- **Updated `dactor` dependency from 0.2 to 0.3** across all crates (`dstate`,
+  `dstate-dactor`, `dstate-integration`). dactor 0.3 adds `SystemActorConfig`
+  with `SpawnManager` pooling and bounded mailboxes.
+- **Updated `dactor-mock` dependency from 0.2 to 0.3** in `dstate-dactor` and
+  `dstate-integration`.
+- **`dstate-integration` now uses `dstate-dactor::StateActor`** for dactor-mock
+  functional tests instead of its own `DstateActor` shell. The custom `shell` module
+  has been removed.
+
+## [1.0.0] — 2026-04-22
 
 ### Breaking Changes
 

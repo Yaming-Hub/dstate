@@ -72,9 +72,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "dactor"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3336f19c963f61f82308808cc5eae0d800524f0f596b80f86fb2ccbcb0f8ca9c"
+checksum = "fd5976b872ddb5a5ced8ccd0f243df4a9860de02e3d70e55811337eea7926e61"
 dependencies = [
  "async-trait",
  "futures",
@@ -91,9 +91,9 @@ dependencies = [
 
 [[package]]
 name = "dactor-mock"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8b10167a75c04c21cb3b1f3d49070a7bab6f41a217536b7be681e6087790cc0"
+checksum = "e1f7f3c2492a1f7d31f4e7ac09520894c5a9844550dca3242a26ee2de38613fd"
 dependencies = [
  "async-trait",
  "dactor",
@@ -141,6 +141,7 @@ dependencies = [
  "dactor",
  "dactor-mock",
  "dstate",
+ "dstate-dactor",
  "serde",
  "tokio",
  "tokio-util",
